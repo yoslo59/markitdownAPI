@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# Outils utiles (OCR, audio, healthcheck)
+# Binaries utiles (OCR + tests HTTP)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     tesseract-ocr \
@@ -9,13 +9,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
  && rm -rf /var/lib/apt/lists/*
 
-# Dépendances Python
+# Dépendances Python (ajout: pymupdf, pytesseract, pillow)
 RUN pip install --no-cache-dir \
     "markitdown[all]" \
     fastapi \
     uvicorn \
     python-multipart \
-    openai
+    openai \
+    pymupdf \
+    pytesseract \
+    pillow
 
 WORKDIR /app
 COPY main.py /app/main.py
