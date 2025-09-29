@@ -1,11 +1,18 @@
 import os
+import io
+from typing import Optional
+
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
+
 from markitdown import MarkItDown
-from typing import Optional
 from openai import AzureOpenAI
 
+
+# ---------------------------
+# Config via variables d'env
+# ---------------------------
 SAVE_UPLOADS  = os.getenv("SAVE_UPLOADS", "false").lower() == "true"
 SAVE_OUTPUTS  = os.getenv("SAVE_OUTPUTS", "false").lower() == "true"
 UPLOAD_DIR    = os.getenv("UPLOAD_DIR", "/data/uploads")
@@ -16,12 +23,16 @@ AZURE_KEY        = os.getenv("AZURE_OPENAI_KEY", "").strip()
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini").strip()
 AZURE_API_VER    = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview").strip()
 
+# Dossiers persistants (si activés)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-app = FastAPI(title="MarkItDown API", version="1.1")
+# ---------------------------
+# App FastAPI
+# ---------------------------
+app = FastAPI(title="MarkItDown API", version="1.2")
 
-# CORS (utile si tu appelles depuis un front)
+# CORS (utile si front séparé)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,7 +41,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 def get_azure_client() -> Optional[AzureOpenAI]:
+    """Retourne un client AzureOpenAI si correctement configuré, sinon None."""
     if AZURE_ENDPOINT and AZURE_KEY:
         return AzureOpenAI(
             azure_endpoint=AZURE_ENDPOINT,
@@ -39,9 +52,13 @@ def get_azure_client() -> Optional[AzureOpenAI]:
         )
     return None
 
+
+# ---------------------------
+# Mini interface web
+# ---------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
-    # Mini UI basique : upload, options, rendu du Markdown et téléchargement
+    # UI simple pour uploader un fichier et lancer la conversion
     return """
 <!doctype html>
 <html lang="fr">
@@ -50,9 +67,10 @@ def index():
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>MarkItDown UI</title>
   <style>
-    body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial; padding:24px; max-width: 900px; margin:auto;}
-    h1{margin-bottom:0.2rem}
-    .card{border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin-top:16px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+    :root{color-scheme: light dark;}
+    body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial; padding:24px; max-width: 980px; margin:auto; line-height:1.45}
+    h1{margin-bottom:0.5rem}
+    .card{border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin-top:16px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
     .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
     label{font-weight:600}
     button{padding:10px 16px;border:1px solid #111;border-radius:10px;background:#111;color:#fff;cursor:pointer}
@@ -60,11 +78,12 @@ def index():
     textarea{width:100%;min-height:260px;padding:12px;border-radius:10px;border:1px solid #e5e7eb;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace}
     .muted{color:#6b7280;font-size:12px}
     input[type="checkbox"]{transform: scale(1.2);}
+    a#download{padding:10px 16px;border:1px solid #111;border-radius:10px;text-decoration:none}
   </style>
 </head>
 <body>
   <h1>MarkItDown — Conversion</h1>
-  <p class="muted">Upload un document (PDF, DOCX, PPTX, etc.) → Markdown. Optionnel : demander un résumé via Azure OpenAI.</p>
+  <p class="muted">Upload un document (PDF, DOCX, PPTX, XLSX, HTML, etc.) → Markdown. Optionnel : résumé via Azure OpenAI.</p>
 
   <div class="card">
     <div class="row">
@@ -119,7 +138,7 @@ $("convert").onclick = async () => {
     $("md").value = json.markdown || "";
     $("meta").value = JSON.stringify(json.metadata || {}, null, 2);
 
-    // Prépare le téléchargement du MD
+    // Download du MD
     const blob = new Blob([$("md").value], {type:"text/markdown;charset=utf-8"});
     const url  = URL.createObjectURL(blob);
     const a = $("download");
@@ -138,19 +157,30 @@ $("convert").onclick = async () => {
 </html>
     """
 
+
+# ---------------------------
+# Endpoint API de conversion
+# ---------------------------
 @app.post("/convert")
 async def convert(
     file: UploadFile = File(...),
     use_plugins: bool = Form(False),
     docintel_endpoint: Optional[str] = Form(None),
-    llm_model: Optional[str] = Form(None),
+    llm_model: Optional[str] = Form(None),   # ignoré pour Azure; gardé pour compat
     use_llm: bool = Form(False),
 ):
+    """
+    Reçoit un fichier, exécute MarkItDown et renvoie le Markdown + métadonnées.
+    Optionnel: résumé Azure OpenAI si `use_llm=true` et que l'Azure est configuré.
+    """
+
+    # Instanciation MarkItDown (plugins/Document Intelligence en option)
     md = MarkItDown(
         enable_plugins=use_plugins,
         docintel_endpoint=docintel_endpoint
     )
 
+    # Lecture du contenu
     content = await file.read()
 
     # Sauvegarde d'entrée si demandé
@@ -160,8 +190,8 @@ async def convert(
         with open(in_path, "wb") as f:
             f.write(content)
 
-    # Conversion principale
-    result = md.convert_stream(content, file_name=file.filename)
+    stream = io.BytesIO(content)
+    result = md.convert_stream(stream, file_name=file.filename)
     markdown = result.text_content or ""
 
     # Sauvegarde de sortie si demandé
@@ -172,13 +202,13 @@ async def convert(
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(markdown)
 
-    # Résumé via Azure (optionnel)
+    # Résumé via Azure (optionnel, robuste : n'échoue pas la conversion si erreur)
     azure_summary = None
     if use_llm:
         client = get_azure_client()
         if client:
             try:
-                # On tronque le contenu si besoin (éviter une requête trop longue)
+                # on tronque le contenu pour éviter des requêtes trop volumineuses
                 snippet = markdown[:12000]
                 resp = client.chat.completions.create(
                     model=AZURE_DEPLOYMENT,
@@ -191,7 +221,6 @@ async def convert(
                 )
                 azure_summary = resp.choices[0].message.content
             except Exception as e:
-                # On n'échoue pas la conversion pour une erreur LLM : on renvoie juste le markdown
                 azure_summary = f"[Erreur Azure OpenAI: {type(e).__name__}: {e}]"
         else:
             azure_summary = "[Azure OpenAI non configuré]"
@@ -209,6 +238,10 @@ async def convert(
         "metadata": metadata,
     })
 
+
+# ---------------------------
+# Healthcheck
+# ---------------------------
 @app.get("/health", response_class=PlainTextResponse)
 def health():
     return "ok"
