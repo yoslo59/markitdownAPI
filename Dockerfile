@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg tesseract-ocr curl \
+    ffmpeg tesseract-ocr tesseract-ocr-fra tesseract-ocr-eng curl \
  && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir "markitdown[all]" fastapi uvicorn python-multipart openai
