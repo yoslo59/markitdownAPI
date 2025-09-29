@@ -217,7 +217,6 @@ async def convert(
                             {"role": "system", "content": "Tu es un assistant qui résume des documents techniques en français, de manière concise et structurée."},
                             {"role": "user", "content": f"Résume le document suivant en 10 points maximum, avec un titre en H1 et des sous-titres:\n\n{snippet}"}
                         ],
-                        temperature=0.2,
                         max_completion_tokens=800
                     )
                     metadata["azure_summary"] = resp.choices[0].message.content
