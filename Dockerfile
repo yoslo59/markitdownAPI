@@ -1,10 +1,10 @@
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg tesseract-ocr \
+    ffmpeg tesseract-ocr curl \
  && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir "markitdown[all]" fastapi uvicorn python-multipart
+RUN pip install --no-cache-dir "markitdown[all]" fastapi uvicorn python-multipart openai
 
 WORKDIR /app
 COPY main.py /app/main.py
