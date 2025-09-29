@@ -1,6 +1,6 @@
 import os
 import io
-from typing import Optional
+from typing import Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
@@ -8,6 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from markitdown import MarkItDown
 from openai import AzureOpenAI
+
+# OCR libs (python)
+import pytesseract
+from PIL import Image
+import fitz  # PyMuPDF
 
 # ---------------------------
 # Config via variables d'env
@@ -19,10 +24,17 @@ OUTPUT_DIR    = os.getenv("OUTPUT_DIR", "/data/outputs")
 
 AZURE_ENDPOINT   = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
 AZURE_KEY        = os.getenv("AZURE_OPENAI_KEY", "").strip()
-AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "o4-mini").strip()
+AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "o4-mini").strip()  # nom EXACT du déploiement
 AZURE_API_VER    = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview").strip()
 
-#Endpoint Azure Document Intelligence par défaut
+# OCR settings
+OCR_ENABLED          = os.getenv("OCR_ENABLED", "true").lower() == "true"
+OCR_LANGS            = os.getenv("OCR_LANGS", "fra+eng").strip()   # packs installés dans l'image
+OCR_DPI              = int(os.getenv("OCR_DPI", "200"))
+OCR_MAX_PAGES        = int(os.getenv("OCR_MAX_PAGES", "20"))       # sécurité perf
+OCR_MIN_CHARS        = int(os.getenv("OCR_MIN_CHARS", "500"))      # si résultat MD < seuil => OCR fallback
+OCR_MODE             = os.getenv("OCR_MODE", "replace_when_empty").strip()  # "replace_when_empty" | "append"
+# Optionnel : Endpoint Azure Document Intelligence par défaut (meilleur que OCR brut pour PDF scannés complexes)
 DEFAULT_DOCINTEL_ENDPOINT = os.getenv("DEFAULT_DOCINTEL_ENDPOINT", "").strip()
 
 # Dossiers persistants
@@ -32,7 +44,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="1.5")
+app = FastAPI(title="MarkItDown API", version="1.6")
 
 # CORS
 app.add_middleware(
@@ -53,7 +65,52 @@ def get_azure_client() -> Optional[AzureOpenAI]:
     return None
 
 # ---------------------------
-# Mini interface web (HTML dans une variable)
+# Utils
+# ---------------------------
+def guess_is_pdf(filename: str, content_type: Optional[str]) -> bool:
+    if content_type and content_type.lower() in ("application/pdf", "pdf"):
+        return True
+    return filename.lower().endswith(".pdf")
+
+def guess_is_image(filename: str, content_type: Optional[str]) -> bool:
+    if content_type and content_type.lower().startswith("image/"):
+        return True
+    return any(filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"))
+
+def ocr_image_bytes(img_bytes: bytes, langs: str) -> str:
+    with Image.open(io.BytesIO(img_bytes)) as im:
+        # convert to RGB (Tesseract préfère)
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        return pytesseract.image_to_string(im, lang=langs)
+
+def ocr_pdf_bytes(pdf_bytes: bytes, langs: str, dpi: int, max_pages: int) -> Tuple[str, int]:
+    """
+    Rasterise chaque page du PDF avec PyMuPDF, OCR via Tesseract.
+    Retourne (texte, nb_pages_ocrisées).
+    """
+    text_parts = []
+    pages_done = 0
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        total_pages = doc.page_count
+        pages_to_process = min(total_pages, max_pages)
+        for i in range(pages_to_process):
+            page = doc.load_page(i)
+            # Rendu raster (dpi)
+            mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+            pix = page.get_pixmap(matrix=mat)
+            im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            page_txt = pytesseract.image_to_string(im, lang=langs)
+            if page_txt.strip():
+                text_parts.append(f"\n\n## Page {i+1}\n\n{page_txt.strip()}")
+            pages_done += 1
+    finally:
+        doc.close()
+    return ("\n".join(text_parts).strip(), pages_done)
+
+# ---------------------------
+# Mini interface web
 # ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
@@ -79,7 +136,7 @@ HTML_PAGE = r'''<!doctype html>
 </head>
 <body>
   <h1>MarkItDown — Conversion</h1>
-  <p class="muted">Upload un document (PDF, DOCX, PPTX, XLSX, HTML, etc.) → Markdown. Optionnel : résumé via Azure OpenAI et/ou Azure Document Intelligence.</p>
+  <p class="muted">Upload un document (PDF, DOCX, PPTX, XLSX, HTML, etc.) → Markdown. Optionnel : résumé via Azure OpenAI et OCR fallback pour PDF/images.</p>
 
   <div class="card">
     <div class="row">
@@ -91,6 +148,8 @@ HTML_PAGE = r'''<!doctype html>
       <input id="plugins" type="checkbox" />
       <label for="llm">Résumé Azure LLM</label>
       <input id="llm" type="checkbox" />
+      <label for="forceocr">Forcer OCR</label>
+      <input id="forceocr" type="checkbox" />
     </div>
     <div class="row" style="margin-top:8px; gap:8px; align-items:baseline;">
       <label for="di">Endpoint Azure Document Intelligence</label>
@@ -118,7 +177,6 @@ HTML_PAGE = r'''<!doctype html>
 const $ = (id)=>document.getElementById(id);
 const endpoint = "/convert";
 
-// Préremplir l'endpoint DI depuis /config si dispo
 fetch("/config").then(r=>r.ok?r.json():null).then(j=>{
   if(j && j.docintel_default){ $("di").value = j.docintel_default; }
 }).catch(()=>{});
@@ -137,6 +195,7 @@ $("convert").onclick = async () => {
   fd.append("use_plugins", $("plugins").checked ? "true" : "false");
   fd.append("use_llm", $("llm").checked ? "true" : "false");
   fd.append("docintel_endpoint", $("di").value || "");
+  fd.append("force_ocr", $("forceocr").checked ? "true" : "false");
 
   try{
     const res = await fetch(endpoint, { method:"POST", body: fd });
@@ -181,7 +240,13 @@ async def convert(
     docintel_endpoint: Optional[str] = Form(None),
     llm_model: Optional[str] = Form(None),   # ignoré pour Azure; gardé pour compat
     use_llm: bool = Form(False),
+    force_ocr: bool = Form(False),
 ):
+    """
+    Reçoit un fichier, exécute MarkItDown et renvoie le Markdown + métadonnées.
+    Fallback OCR (Tesseract) sur PDF/images si contenu trop pauvre ou si force_ocr=true.
+    Optionnel: résumé Azure OpenAI si `use_llm=true` et Azure configuré.
+    """
     try:
         # Fallback DI si non fourni par la requête
         if not docintel_endpoint:
@@ -194,21 +259,53 @@ async def convert(
 
         content = await file.read()
 
+        # Persist input
         in_path = None
         if SAVE_UPLOADS:
             in_path = os.path.join(UPLOAD_DIR, file.filename)
             with open(in_path, "wb") as f:
                 f.write(content)
 
+        # Conversion MarkItDown
         stream = io.BytesIO(content)
         result = md.convert_stream(stream, file_name=file.filename)
-
         markdown = getattr(result, "text_content", "") or ""
         metadata = getattr(result, "metadata", None) or {}
         warnings = getattr(result, "warnings", None)
         if warnings:
             metadata["warnings"] = warnings
 
+        # ------------- OCR Fallback -------------
+        is_pdf = guess_is_pdf(file.filename, file.content_type)
+        is_img = guess_is_image(file.filename, file.content_type)
+        needs_ocr = OCR_ENABLED and (force_ocr or (len(markdown.strip()) < OCR_MIN_CHARS and (is_pdf or is_img)))
+
+        if needs_ocr:
+            ocr_text = ""
+            pages_done = 0
+            if is_pdf:
+                ocr_text, pages_done = ocr_pdf_bytes(content, OCR_LANGS, OCR_DPI, OCR_MAX_PAGES)
+                metadata["ocr_pages"] = pages_done
+                metadata["ocr_langs"] = OCR_LANGS
+                metadata["ocr_dpi"] = OCR_DPI
+            elif is_img:
+                ocr_text = ocr_image_bytes(content, OCR_LANGS)
+                metadata["ocr_pages"] = 1
+                metadata["ocr_langs"] = OCR_LANGS
+
+            if ocr_text.strip():
+                if OCR_MODE == "append" and markdown.strip():
+                    markdown += "\n\n# OCR (extrait)\n" + ocr_text
+                else:
+                    # replace_when_empty (par défaut) OU si le markdown est quasi vide
+                    if len(markdown.strip()) < OCR_MIN_CHARS:
+                        markdown = ocr_text if not is_pdf else f"# OCR\n{ocr_text}"
+                    else:
+                        markdown += "\n\n# OCR (extrait)\n" + ocr_text
+            else:
+                metadata["ocr_note"] = "OCR tenté mais aucun texte trouvé."
+
+        # Persist output
         out_name = f"{os.path.splitext(file.filename)[0]}.md"
         out_path = None
         if SAVE_OUTPUTS:
@@ -216,6 +313,7 @@ async def convert(
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(markdown)
 
+        # Résumé Azure (optionnel, robuste)
         if use_llm:
             client = get_azure_client()
             if client:
@@ -233,7 +331,14 @@ async def convert(
                     content_msg = None
                     if resp and getattr(resp, "choices", None):
                         msg = resp.choices[0].message
-                        content_msg = getattr(msg, "content", None)
+                        if hasattr(msg, "content") and isinstance(msg.content, str):
+                            content_msg = msg.content
+                        elif hasattr(msg, "content") and isinstance(msg.content, list):
+                            parts = []
+                            for part in msg.content:
+                                if isinstance(part, dict) and "text" in part:
+                                    parts.append(part["text"])
+                            content_msg = "".join(parts) if parts else None
                     metadata["azure_summary"] = content_msg or "[Résumé vide (vérifie le déploiement et le contenu)]"
                 except Exception as e:
                     metadata["azure_summary"] = f"[Erreur Azure OpenAI: {type(e).__name__}: {e}]"
