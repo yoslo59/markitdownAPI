@@ -2,7 +2,7 @@ import os
 import io
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -30,7 +30,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="1.2")
+app = FastAPI(title="MarkItDown API", version="1.3")
 
 # CORS (utile si front séparé)
 app.add_middleware(
@@ -41,7 +41,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 def get_azure_client() -> Optional[AzureOpenAI]:
     """Retourne un client AzureOpenAI si correctement configuré, sinon None."""
     if AZURE_ENDPOINT and AZURE_KEY:
@@ -51,7 +50,6 @@ def get_azure_client() -> Optional[AzureOpenAI]:
             api_version=AZURE_API_VER
         )
     return None
-
 
 # ---------------------------
 # Mini interface web
@@ -157,7 +155,6 @@ $("convert").onclick = async () => {
 </html>
     """
 
-
 # ---------------------------
 # Endpoint API de conversion
 # ---------------------------
@@ -173,71 +170,79 @@ async def convert(
     Reçoit un fichier, exécute MarkItDown et renvoie le Markdown + métadonnées.
     Optionnel: résumé Azure OpenAI si `use_llm=true` et que l'Azure est configuré.
     """
+    try:
+        md = MarkItDown(
+            enable_plugins=use_plugins,
+            docintel_endpoint=docintel_endpoint
+        )
 
-    # Instanciation MarkItDown (plugins/Document Intelligence en option)
-    md = MarkItDown(
-        enable_plugins=use_plugins,
-        docintel_endpoint=docintel_endpoint
-    )
+        # Lecture du contenu
+        content = await file.read()
 
-    # Lecture du contenu
-    content = await file.read()
+        # Sauvegarde d'entrée si demandé
+        in_path = None
+        if SAVE_UPLOADS:
+            in_path = os.path.join(UPLOAD_DIR, file.filename)
+            with open(in_path, "wb") as f:
+                f.write(content)
 
-    # Sauvegarde d'entrée si demandé
-    in_path = None
-    if SAVE_UPLOADS:
-        in_path = os.path.join(UPLOAD_DIR, file.filename)
-        with open(in_path, "wb") as f:
-            f.write(content)
+        stream = io.BytesIO(content)
+        result = md.convert_stream(stream, file_name=file.filename)
 
-    stream = io.BytesIO(content)
-    result = md.convert_stream(stream, file_name=file.filename)
-    markdown = result.text_content or ""
+        # Récupération safe des champs du résultat
+        markdown = getattr(result, "text_content", "") or ""
+        metadata = getattr(result, "metadata", None) or {}
+        # Certaines implémentations exposent warnings/info différemment : on tente de les remonter si présents
+        warnings = getattr(result, "warnings", None)
+        if warnings:
+            metadata["warnings"] = warnings
 
-    # Sauvegarde de sortie si demandé
-    out_name = f"{os.path.splitext(file.filename)[0]}.md"
-    out_path = None
-    if SAVE_OUTPUTS:
-        out_path = os.path.join(OUTPUT_DIR, out_name)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(markdown)
+        # Sauvegarde de sortie si demandé
+        out_name = f"{os.path.splitext(file.filename)[0]}.md"
+        out_path = None
+        if SAVE_OUTPUTS:
+            out_path = os.path.join(OUTPUT_DIR, out_name)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(markdown)
 
-    # Résumé via Azure (optionnel, robuste : n'échoue pas la conversion si erreur)
-    azure_summary = None
-    if use_llm:
-        client = get_azure_client()
-        if client:
-            try:
-                # on tronque le contenu pour éviter des requêtes trop volumineuses
-                snippet = markdown[:12000]
-                resp = client.chat.completions.create(
-                    model=AZURE_DEPLOYMENT,
-                    messages=[
-                        {"role": "system", "content": "Tu es un assistant qui résume des documents techniques en français, de manière concise et structurée."},
-                        {"role": "user", "content": f"Résume le document suivant en 10 points maximum, avec un titre en H1 et des sous-titres:\n\n{snippet}"}
-                    ],
-                    temperature=0.2,
-                    max_tokens=800
-                )
-                azure_summary = resp.choices[0].message.content
-            except Exception as e:
-                azure_summary = f"[Erreur Azure OpenAI: {type(e).__name__}: {e}]"
-        else:
-            azure_summary = "[Azure OpenAI non configuré]"
+        # Résumé via Azure (optionnel, n'échoue pas la conversion si erreur)
+        if use_llm:
+            client = get_azure_client()
+            if client:
+                try:
+                    snippet = markdown[:12000]
+                    resp = client.chat.completions.create(
+                        model=AZURE_DEPLOYMENT,
+                        messages=[
+                            {"role": "system", "content": "Tu es un assistant qui résume des documents techniques en français, de manière concise et structurée."},
+                            {"role": "user", "content": f"Résume le document suivant en 10 points maximum, avec un titre en H1 et des sous-titres:\n\n{snippet}"}
+                        ],
+                        temperature=0.2,
+                        max_tokens=800
+                    )
+                    metadata["azure_summary"] = resp.choices[0].message.content
+                except Exception as e:
+                    metadata["azure_summary"] = f"[Erreur Azure OpenAI: {type(e).__name__}: {e}]"
+            else:
+                metadata["azure_summary"] = "[Azure OpenAI non configuré]"
 
-    # Métadonnées enrichies
-    metadata = result.metadata or {}
-    if in_path:  metadata["saved_input_path"]  = in_path
-    if out_path: metadata["saved_output_path"] = out_path
-    if use_llm:  metadata["azure_summary"]     = azure_summary
+        # Enrichissement chemins de persistance
+        if SAVE_UPLOADS and in_path:
+            metadata["saved_input_path"] = in_path
+        if SAVE_OUTPUTS and out_path:
+            metadata["saved_output_path"] = out_path
 
-    return JSONResponse({
-        "filename": file.filename,
-        "output_filename": out_name if SAVE_OUTPUTS else None,
-        "markdown": markdown,
-        "metadata": metadata,
-    })
-
+        return JSONResponse({
+            "filename": file.filename,
+            "output_filename": out_name if SAVE_OUTPUTS else None,
+            "markdown": markdown,
+            "metadata": metadata,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Log minimal côté réponse (tu as les traces dans les logs conteneur)
+        raise HTTPException(status_code=500, detail=f"Conversion error: {type(e).__name__}: {e}")
 
 # ---------------------------
 # Healthcheck
