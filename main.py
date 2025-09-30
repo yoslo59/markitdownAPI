@@ -1,5 +1,6 @@
 import os
 import io
+import re
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -14,7 +15,6 @@ import pytesseract
 from PIL import Image, ImageOps, ImageFilter
 import fitz  # PyMuPDF
 
-
 # ---------------------------
 # Config via variables d'env
 # ---------------------------
@@ -23,22 +23,24 @@ SAVE_OUTPUTS  = os.getenv("SAVE_OUTPUTS", "false").lower() == "true"
 UPLOAD_DIR    = os.getenv("UPLOAD_DIR", "/data/uploads")
 OUTPUT_DIR    = os.getenv("OUTPUT_DIR", "/data/outputs")
 
+# Azure OpenAI
 AZURE_ENDPOINT   = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
 AZURE_KEY        = os.getenv("AZURE_OPENAI_KEY", "").strip()
-AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini").strip()  # nom EXACT du déploiement
+AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "o4-mini").strip()
 AZURE_API_VER    = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview").strip()
 
 # OCR (tunable sans rebuild)
-OCR_ENABLED       = os.getenv("OCR_ENABLED", "true").lower() == "true"
-OCR_LANGS         = os.getenv("OCR_LANGS", "fra+eng").strip()
-OCR_DPI           = int(os.getenv("OCR_DPI", "300"))
-OCR_MAX_PAGES     = int(os.getenv("OCR_MAX_PAGES", "25"))
-OCR_MIN_CHARS     = int(os.getenv("OCR_MIN_CHARS", "500"))
-OCR_MODE          = os.getenv("OCR_MODE", "replace_when_empty").strip()  # replace_when_empty | append
-OCR_PSM           = os.getenv("OCR_PSM", "6").strip()
-OCR_KEEP_SPACES   = os.getenv("OCR_KEEP_SPACES", "true").lower() == "true"
-OCR_TWO_PASS      = os.getenv("OCR_TWO_PASS", "true").lower() == "true"
-OCR_TABLE_MODE    = os.getenv("OCR_TABLE_MODE", "false").lower() == "true"
+OCR_ENABLED        = os.getenv("OCR_ENABLED", "true").lower() == "true"
+OCR_LANGS          = os.getenv("OCR_LANGS", "fra+eng").strip()
+OCR_DPI            = int(os.getenv("OCR_DPI", "350"))              # 350 par défaut (screenshots)
+OCR_MAX_PAGES      = int(os.getenv("OCR_MAX_PAGES", "25"))
+OCR_MIN_CHARS      = int(os.getenv("OCR_MIN_CHARS", "500"))
+OCR_MODE           = os.getenv("OCR_MODE", "append").strip()       # replace_when_empty | append
+OCR_KEEP_SPACES    = os.getenv("OCR_KEEP_SPACES", "true").lower() == "true"
+OCR_TWO_PASS       = os.getenv("OCR_TWO_PASS", "true").lower() == "true"
+OCR_TABLE_MODE     = os.getenv("OCR_TABLE_MODE", "true").lower() == "true"
+OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,4,11").split(",")]           # 6=block, 4=columns, 11=sparse
+OCR_DPI_CANDIDATES = [int(x) for x in os.getenv("OCR_DPI_CANDIDATES", "300,350,400").split(",")]
 
 # (Optionnel) Endpoint Azure Document Intelligence par défaut
 DEFAULT_DOCINTEL_ENDPOINT = os.getenv("DEFAULT_DOCINTEL_ENDPOINT", "").strip()
@@ -47,11 +49,10 @@ DEFAULT_DOCINTEL_ENDPOINT = os.getenv("DEFAULT_DOCINTEL_ENDPOINT", "").strip()
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="1.7")
+app = FastAPI(title="MarkItDown API", version="1.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,7 +61,6 @@ app.add_middleware(
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
-
 
 def get_azure_client() -> Optional[AzureOpenAI]:
     if AZURE_ENDPOINT and AZURE_KEY:
@@ -71,12 +71,13 @@ def get_azure_client() -> Optional[AzureOpenAI]:
         )
     return None
 
+# ---------------------------
+# Helpers OCR
+# ---------------------------
+_table_chars = re.compile(r"[|+\-=_]{3,}")
 
-# ---------------------------
-# Utils OCR
-# ---------------------------
-def _tess_config(base_psm: str, keep_spaces: bool, table_mode: bool) -> str:
-    cfg = f"--psm {base_psm}"
+def _tess_config(psm: str, keep_spaces: bool, table_mode: bool) -> str:
+    cfg = f"--psm {psm} --oem 1"
     if keep_spaces:
         cfg += " -c preserve_interword_spaces=1"
     if table_mode:
@@ -90,17 +91,78 @@ def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
     g = g.point(lambda p: 255 if p > 190 else (0 if p < 110 else p))
     return g
 
-def ocr_image_bytes(img_bytes: bytes, langs: str) -> str:
-    with Image.open(io.BytesIO(img_bytes)) as im:
-        if im.mode not in ("RGB", "L"):
-            im = im.convert("RGB")
-        cfg = _tess_config(OCR_PSM, OCR_KEEP_SPACES, OCR_TABLE_MODE)
-        txt1 = pytesseract.image_to_string(im, lang=langs, config=cfg) or ""
+def _score_text_for_table(txt: str) -> float:
+    """Score simple favorisant les rendus type tableau/monospace et pénalisant le bruit évident."""
+    if not txt:
+        return 0.0
+    lines = txt.splitlines()
+    n = max(1, len(lines))
+    pipes = sum(l.count("|") for l in lines)
+    plus  = sum(l.count("+") for l in lines)
+    dashes= sum(l.count("-") for l in lines)
+    ascii_blocks = sum(1 for l in lines if _table_chars.search(l))
+    noise = sum(1 for l in lines if "nnn" in l or "Se ne" in l or "—" in l)
+    return (pipes*1.0 + plus*0.6 + dashes*0.3 + ascii_blocks*2.0)/n - noise*0.2 + len(txt)/5000.0
+
+def _wrap_tables_as_code(txt: str) -> str:
+    """Détecte des blocs ASCII et les emballe dans ```text``` pour préserver l’alignement en Markdown."""
+    if not txt:
+        return txt
+    out = []
+    buf = []
+    in_blk = False
+    for line in txt.splitlines():
+        is_tbl = _table_chars.search(line) is not None or line.strip().startswith("|")
+        if is_tbl and not in_blk:
+            in_blk = True
+            out.append("```text")
+            buf = []
+        if in_blk and not is_tbl and buf:
+            # fin de bloc
+            out.extend(buf)
+            out.append("```")
+            in_blk = False
+            out.append(line)
+            buf = []
+            continue
+        if in_blk:
+            buf.append(line)
+        else:
+            out.append(line)
+    if in_blk:
+        out.extend(buf)
+        out.append("```")
+    return "\n".join(out)
+
+def _ocr_image_best(im: Image.Image, langs: str) -> str:
+    if im.mode not in ("RGB", "L"):
+        im = im.convert("RGB")
+    candidates = []
+    for psm in OCR_PSMS:
+        cfg = _tess_config(psm, OCR_KEEP_SPACES, OCR_TABLE_MODE)
+        # Pass brute
+        t1 = pytesseract.image_to_string(im, lang=langs, config=cfg) or ""
+        best = t1
+        # Pass pré-traitée
         if OCR_TWO_PASS:
             im2 = _preprocess_for_ocr(im)
-            txt2 = pytesseract.image_to_string(im2, lang=langs, config=cfg) or ""
-            return txt2 if len(txt2) > len(txt1) else txt1
-        return txt1
+            t2 = pytesseract.image_to_string(im2, lang=langs, config=cfg) or ""
+            if len(t2) > len(best):
+                best = t2
+        candidates.append((best, _score_text_for_table(best)))
+    candidates.sort(key=lambda x: x[1], reverse=True)  # meilleur score d'abord
+    return candidates[0][0].strip() if candidates else ""
+
+def ocr_image_bytes(img_bytes: bytes, langs: str) -> str:
+    with Image.open(io.BytesIO(img_bytes)) as im:
+        txt = _ocr_image_best(im, langs)
+        return _wrap_tables_as_code(txt)
+
+def _raster_pdf_page(page, dpi: int) -> Image.Image:
+    scale = dpi / 72.0
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 def ocr_pdf_bytes(pdf_bytes: bytes, langs: str, dpi: int, max_pages: int) -> tuple[str, int]:
     out = []
@@ -110,22 +172,17 @@ def ocr_pdf_bytes(pdf_bytes: bytes, langs: str, dpi: int, max_pages: int) -> tup
         total_pages = doc.page_count
         for i in range(min(total_pages, max_pages)):
             page = doc.load_page(i)
-            scale = dpi / 72.0
-            mat = fitz.Matrix(scale, scale)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-            cfg = _tess_config(OCR_PSM, OCR_KEEP_SPACES, OCR_TABLE_MODE)
-            txt1 = pytesseract.image_to_string(im, lang=langs, config=cfg) or ""
-            txt_best = txt1
-            if OCR_TWO_PASS:
-                im2 = _preprocess_for_ocr(im)
-                txt2 = pytesseract.image_to_string(im2, lang=langs, config=cfg) or ""
-                if len(txt2) > len(txt1):
-                    txt_best = txt2
-
-            if txt_best.strip():
-                out.append(f"\n\n## Page {i+1}\n\n{txt_best.strip()}")
+            best_txt = ""
+            best_score = -1e9
+            # multi-DPI par page
+            for d in OCR_DPI_CANDIDATES:
+                im = _raster_pdf_page(page, d)
+                txt = _ocr_image_best(im, langs)
+                sc  = _score_text_for_table(txt)
+                if sc > best_score:
+                    best_txt, best_score = txt, sc
+            if best_txt.strip():
+                out.append(f"\n\n## Page {i+1}\n\n{_wrap_tables_as_code(best_txt)}")
             pages_done += 1
     finally:
         doc.close()
@@ -140,7 +197,6 @@ def guess_is_image(filename: str, content_type: Optional[str]) -> bool:
     if content_type and content_type.lower().startswith("image/"):
         return True
     return any(filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"))
-
 
 # ---------------------------
 # Mini interface web
@@ -263,7 +319,6 @@ def index():
 def get_config():
     return JSONResponse({"docintel_default": DEFAULT_DOCINTEL_ENDPOINT})
 
-
 # ---------------------------
 # Endpoint API de conversion
 # ---------------------------
@@ -347,7 +402,7 @@ async def convert(
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(markdown)
 
-        # Azure résumé
+        # Azure résumé (optionnel)
         if use_llm:
             client = get_azure_client()
             if client:
@@ -395,7 +450,6 @@ async def convert(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Conversion error: {type(e).__name__}: {e}")
-
 
 # ---------------------------
 # Healthcheck
