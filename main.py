@@ -12,13 +12,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from markitdown import MarkItDown
 from openai import AzureOpenAI
 
-# OCR libs
+# OCR / images
 import pytesseract
 from PIL import Image, ImageOps, ImageFilter
 import fitz  # PyMuPDF
 
-# === NEW: data utils
+# === NEW: data & vision utils
 import pandas as pd
+import numpy as np  # IMPORTANT: requis pour OpenCV pipeline
 try:
     import cv2  # OpenCV (headless)
     _HAS_CV2 = True
@@ -49,10 +50,10 @@ OCR_MODE           = os.getenv("OCR_MODE", "append").strip()
 OCR_KEEP_SPACES    = os.getenv("OCR_KEEP_SPACES", "true").lower() == "true"
 OCR_TWO_PASS       = os.getenv("OCR_TWO_PASS", "true").lower() == "true"
 OCR_TABLE_MODE     = os.getenv("OCR_TABLE_MODE", "true").lower() == "true"
-OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,3,4,11").split(",")]  # === NEW add psm 3
+OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,3,4,11").split(",")]
 OCR_DPI_CANDIDATES = [int(x) for x in os.getenv("OCR_DPI_CANDIDATES", "300,350,400").split(",")]
 OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
-# === NEW: deskew + binarisation
+# Prétraitements
 OCR_DESKEW         = os.getenv("OCR_DESKEW", "true").lower() == "true"
 OCR_BINARIZE       = os.getenv("OCR_BINARIZE", "true").lower() == "true"
 
@@ -73,7 +74,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="3.0")  # bump version
+app = FastAPI(title="MarkItDown API", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -115,7 +116,7 @@ def guess_is_csv(filename: str) -> bool:
     return filename.lower().endswith(".csv")
 
 def _md_cleanup(md: str) -> str:
-    """Post-format léger pour la sortie MarkItDown: listes/titres/tableaux ASCII."""
+    """Post-format léger + nettoyage."""
     if not md:
         return md
     lines = []
@@ -125,14 +126,14 @@ def _md_cleanup(md: str) -> str:
         l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)  # "1)" -> "1. "
         lines.append(l)
     txt = "\n".join(lines)
-    # encadre blocs ASCII
+    # Encadre blocs ASCII “grilles”
     txt = re.sub(
         r"(?:^|\n)((?:[|+\-=_].*\n){2,})",
         lambda m: "```text\n" + m.group(1).strip() + "\n```",
         txt,
         flags=re.S
     )
-    # === NEW: tuer les NaN éventuels générés par pandas
+    # Pandas markdown leftovers
     txt = txt.replace(" NaN", " ").replace("NaN", " ")
     return txt.strip()
 
@@ -149,19 +150,20 @@ def _tess_config(psm: str, keep_spaces: bool, table_mode: bool) -> str:
         cfg += " -c tessedit_write_images=false"
     return cfg
 
-# === NEW: OpenCV deskew & binarization
 def _opencv_preprocess_for_ocr(im: Image.Image) -> Image.Image:
     if not _HAS_CV2:
         return im
     # PIL -> OpenCV (grayscale)
     cv = cv2.cvtColor(np.array(im.convert("RGB")), cv2.COLOR_RGB2GRAY)
 
-    # Binarize adaptative (optionnel)
+    # Binarize adaptative
     if OCR_BINARIZE:
-        cv = cv2.adaptiveThreshold(cv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 35, 11)
+        cv = cv2.adaptiveThreshold(
+            cv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 35, 11
+        )
 
-    # Deskew (optionnel)
+    # Deskew
     if OCR_DESKEW:
         coords = cv2.findNonZero(255 - cv)  # texte = noir
         if coords is not None:
@@ -175,15 +177,13 @@ def _opencv_preprocess_for_ocr(im: Image.Image) -> Image.Image:
             M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
             cv = cv2.warpAffine(cv, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
-    # Retour PIL
     return Image.fromarray(cv)
 
 def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
-    # Pipeline léger PIL (toujours sûr)
+    # Pipeline léger PIL (fallback)
     g = ImageOps.grayscale(im)
     g = ImageOps.autocontrast(g, cutoff=1)
     g = g.filter(ImageFilter.MedianFilter(size=3))
-    # Seuil doux
     g = g.point(lambda p: 255 if p > 190 else (0 if p < 110 else p))
     return g
 
@@ -219,12 +219,9 @@ def _wrap_tables_as_code(txt: str) -> str:
 def _ocr_image_best(im: Image.Image, langs: str) -> Tuple[str, float]:
     if im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
-    # === NEW: OpenCV preprocessing first (if available)
+    # OpenCV preprocessing first if available
     try:
-        if _HAS_CV2:
-            im2 = _opencv_preprocess_for_ocr(im)
-        else:
-            im2 = _preprocess_for_ocr(im)
+        im2 = _opencv_preprocess_for_ocr(im) if _HAS_CV2 else _preprocess_for_ocr(im)
     except Exception:
         im2 = _preprocess_for_ocr(im)
 
@@ -296,12 +293,11 @@ def _is_bold(flags: int) -> bool:
     return bool(flags & 1 or flags & 32)
 
 def _classify_heading(size: float, size_levels: List[float]) -> Optional[str]:
-    """Map taille → #, ##, ### selon quantiles mesurés sur la page/document."""
+    """Map taille → #, ##, ### selon les plus grandes tailles rencontrées."""
     if not size_levels:
         return None
-    # size_levels triées décroissant : [H1, H2, H3 ...]
     for idx, s in enumerate(size_levels[:6], start=1):
-        if size >= s * 0.98:  # tolérance
+        if size >= s * 0.98:  # légère tolérance
             return "#" * idx
     return None
 
@@ -325,7 +321,6 @@ def _median_font_size(page_raw: Dict[str,Any]) -> float:
     return sizes[mid] if len(sizes)%2==1 else (sizes[mid-1]+sizes[mid])/2.0
 
 def _collect_sizes(doc: fitz.Document, sample_pages: int = 5) -> List[float]:
-    """Scan quelques pages pour extraire les plus grosses tailles, sert de base aux niveaux Hx."""
     sizes = []
     n = min(sample_pages, doc.page_count)
     for p in range(n):
@@ -341,7 +336,7 @@ def _collect_sizes(doc: fitz.Document, sample_pages: int = 5) -> List[float]:
     if not sizes:
         return []
     sizes = sorted(set(sizes), reverse=True)
-    return sizes[:6]  # top tailles
+    return sizes[:6]
 
 def _line_to_md(spans: List[Dict[str,Any]], size_levels: List[float]) -> str:
     parts = []
@@ -359,10 +354,8 @@ def _line_to_md(spans: List[Dict[str,Any]], size_levels: List[float]) -> str:
     raw = "".join(parts).strip()
     if not raw:
         return ""
-    # list bullets/ordered untouched (laisser "- " ou "1. " si déjà présent)
     if _bullet_re.match(raw):
         return raw
-    # headings by size levels
     h = _classify_heading(max_size, size_levels)
     if h and len(raw) < 180:
         return f"{h} {raw}"
@@ -391,73 +384,120 @@ def _band_key(y_center: float, band_h: float) -> int:
 
 def _merge_wrapped_paragraphs(lines: List[str]) -> List[str]:
     """
-    Fusionne les retours à la ligne cassés par l'extraction en paragraphes continus.
-    Heuristique : si une ligne se termine sans ponctuation forte et que la suivante
-    commence par minuscule, fusionne avec espace.
+    Fusionne les lignes en paragraphes lisibles.
+    - césure (finissant par '-') + minuscule suivante => colle sans espace
+    - pas de ponctuation forte + minuscule suivante => colle avec espace
+    - ligne vide => flush
     """
     out = []
     buf = ""
+
     def flush():
         nonlocal buf
         if buf.strip():
             out.append(buf.strip())
         buf = ""
-    for l in lines:
-        s = l.rstrip()
+
+    for raw in lines:
+        s = raw.rstrip()
         if not s:
             flush()
             continue
-        if buf:
-            # ponctuation forte ?
-            if re.search(r"[.!?;:]$", buf) or s[:1].isupper():
-                # nouveau paragraphe
-                flush()
-                buf = s
-            else:
-                # suite de paragraphe
-                buf += " " + s.lstrip()
-        else:
+
+        if not buf:
             buf = s
+            continue
+
+        # césure (recolle le mot)
+        if buf.endswith("-") and s[:1].islower():
+            buf = buf[:-1] + s.lstrip()
+            continue
+
+        # continuation de phrase
+        if (not re.search(r"[.!?;:]$", buf)) and (s[:1].islower()):
+            buf += " " + s.lstrip()
+        else:
+            flush()
+            buf = s
+
     flush()
     return out
 
 def _ascii_table_to_md(block: str) -> Optional[str]:
     """
     Convertit un tableau ASCII (+---+ ... | ... |) en tableau Markdown via pandas.
-    Retourne None si ce n'est clairement pas un tableau.
     """
     lines = [l for l in block.splitlines() if l.strip()]
     border_lines = [i for i, l in enumerate(lines) if _table_border_re.match(l)]
     if len(border_lines) < 2:
         return None
-    # Garder uniquement les lignes de contenu `| col | col |`
     content = [l for l in lines if l.strip().startswith("|") and l.strip().endswith("|")]
     if not content:
         return None
-    # Split columns
     rows = []
     for row in content:
         cells = [c.strip() for c in row.strip()[1:-1].split("|")]
         rows.append(cells)
     if not rows:
         return None
-    # Première ligne comme header si plausible
     header = rows[0]
     data = rows[1:] if len(rows) > 1 else []
-    # DataFrame -> markdown (github table)
     df = pd.DataFrame(data=data, columns=header)
     df = df.where(df.notna(), "")
     return df.to_markdown(index=False, tablefmt="github")
 
+def _guess_columns(atoms: List[Dict[str,Any]], max_cols: int = 3) -> List[Tuple[float,float]]:
+    """
+    Devine 1–3 colonnes par clustering naïf des x-centres.
+    Retourne des intervalles (x_min, x_max) triés.
+    """
+    xs = []
+    for a in atoms:
+        if a["kind"] != "text":
+            continue
+        x0,y0,x1,y1 = a["bbox"]
+        xs.append(0.5*(x0+x1))
+    if len(xs) < 12:
+        return [(-1e9, 1e9)]
+    xs_sorted = sorted(xs)
+    gaps = []
+    for i in range(1, len(xs_sorted)):
+        gaps.append((xs_sorted[i] - xs_sorted[i-1], i))
+    gaps.sort(reverse=True)
+    cuts = sorted([idx for _, idx in gaps[:max_cols-1]])
+    bands = []
+    start = 0
+    for c in cuts:
+        seg = xs_sorted[start:c]
+        if seg:
+            bands.append( (min(seg), max(seg)) )
+        start = c
+    seg = xs_sorted[start:]
+    if seg:
+        bands.append( (min(seg), max(seg)) )
+    pads = []
+    for (a,b) in bands:
+        width = max(10.0, 0.05*(b-a))
+        pads.append( (a-width, b+width) )
+    return sorted(pads, key=lambda t: t[0])
+
+def _col_index(x_center: float, cols: List[Tuple[float,float]]) -> int:
+    for i,(a,b) in enumerate(cols):
+        if a <= x_center <= b:
+            return i
+    d = [abs((0.5*(a+b)) - x_center) for (a,b) in cols]
+    return int(d.index(min(d)))
+
 def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
     """
-    Parcourt chaque page et insère texte/images à leur place.
-    Améliorations:
-      - Détection titres par niveaux (tailles de police globales)
-      - Fusion intelligente de lignes en paragraphes
-      - Détection listes
-      - OCR local images + fallback page
-      - Conversion tableaux ASCII → vrais tableaux Markdown
+    PDF → Markdown lisible :
+      - Titres (#, ##, ###) via tailles de police
+      - Listes
+      - Paragraphes fusionnés
+      - Tables ASCII → tables Markdown
+      - Images OCR en plein res + embed redimensionné si besoin
+      - Fallback OCR pleine page
+      - Tri lecture multi-colonnes robuste
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     md_lines: List[str] = []
@@ -469,7 +509,6 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
         for p in range(total_pages):
             page = doc.load_page(p)
             raw = page.get_text("rawdict") or {}
-            median_size = _median_font_size(raw)
             line_h_med = _median_line_height(raw)
             band_h = max(8.0, line_h_med * 1.2)
 
@@ -487,7 +526,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                 bbox = (x0,y0,x1,y1)
 
                 if btype == 0:
-                    # Lignes de texte → meilleure granularité
+                    # Lignes de texte
                     for line in b.get("lines", []):
                         spans = line.get("spans", [])
                         if not spans:
@@ -510,22 +549,25 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                         })
 
                 elif btype == 1:
-                    # IMAGE
-                    im = crop_bbox_image(page, bbox, OCR_DPI)
-                    if im is None:
+                    # IMAGE — OCR sur pleine résolution, embed redimensionné
+                    im_full = crop_bbox_image(page, bbox, OCR_DPI)
+                    if im_full is None:
                         info = b.get("image")
                         if isinstance(info, dict) and "xref" in info:
                             try:
                                 pix = fitz.Pixmap(doc, info["xref"])
                                 if pix.n >= 4:
                                     pix = fitz.Pixmap(fitz.csRGB, pix)
-                                im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                                im_full = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                             except Exception:
-                                im = None
-                    if im is None:
+                                im_full = None
+                    if im_full is None:
                         continue
-                    im = _pil_resize_max(im, IMG_MAX_WIDTH)
-                    txt, score = _ocr_image_best(im, OCR_LANGS)
+
+                    txt, score = _ocr_image_best(im_full, OCR_LANGS)
+
+                    im_embed = _pil_resize_max(im_full, IMG_MAX_WIDTH)
+
                     area_ratio = ((x1-x0)*(y1-y0))/page_area
                     is_background_like = area_ratio > 0.85
 
@@ -534,7 +576,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                     else:
                         md_img = ""
                         if EMBED_IMAGES in ("all", "ocr_only"):
-                            data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+                            data_uri = _pil_to_base64(im_embed, IMG_FORMAT, IMG_JPEG_QUALITY)
                             md_img = f'![{IMG_ALT_PREFIX} – page {p+1}]({data_uri})'
 
                     if md_img:
@@ -546,14 +588,17 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                             "area_ratio": area_ratio
                         })
 
-            # Tri lecture
+            # Tri multi-colonnes
+            cols = _guess_columns(atoms, max_cols=3)
             def sort_key(a):
                 x0,y0,x1,y1 = a["bbox"]
                 y_center = 0.5*(y0+y1)
-                return (_band_key(y_center, band_h), x0, y0)
+                x_center = 0.5*(x0+x1)
+                col = _col_index(x_center, cols)
+                return (col, _band_key(y_center, band_h), x0, y0)
             atoms.sort(key=sort_key)
 
-            # Concat avec fusion de paragraphes + conversion tableaux ASCII
+            # Concat + fusion paragraphe + tables ASCII → Markdown
             page_buf: List[str] = []
             para_buf: List[str] = []
             last_band = None
@@ -562,7 +607,6 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                 if not para_buf:
                     return
                 merged = _merge_wrapped_paragraphs(para_buf)
-                # Conversion ASCII table → Markdown table si applicable
                 for block in merged:
                     if _table_chars.search(block) and ("|" in block or "+" in block):
                         md_tbl = _ascii_table_to_md(block)
@@ -590,8 +634,8 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
 
             flush_para()
 
-            # Fallback OCR pleine page si texte pauvre
-            page_text_chars = sum(len(x) for x in page_buf if x and not x.strip().startswith("!["))  # ignore images
+            # Fallback OCR pleine page si la page reste pauvre en texte
+            page_text_chars = sum(len(x) for x in page_buf if x and not x.strip().startswith("!["))
             if page_text_chars < OCR_MIN_CHARS:
                 try:
                     best_txt, best_score = "", -1e9
@@ -604,7 +648,6 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                             break
                     if best_txt.strip():
                         page_buf.append("<!-- OCR page fallback -->")
-                        # tenter conversion ASCII→MD table à l'intérieur aussi
                         blocks = _merge_wrapped_paragraphs(best_txt.splitlines())
                         for block in blocks:
                             if _table_chars.search(block) and ("|" in block or "+" in block):
@@ -627,35 +670,23 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
 # ---------------------------
 # DOCX / XLSX / CSV — conversions dédiées (propres)
 # ---------------------------
-
 def docx_to_md_bytes(data: bytes) -> str:
-    """
-    Utilise MarkItDown. Si images, MarkItDown les inline déjà via plugins.
-    Si besoin d'un contrôle plus fin, on pourrait passer par Mammoth directement.
-    """
     md = MarkItDown(enable_plugins=True).convert_stream(io.BytesIO(data), file_name="file.docx")
     text = getattr(md, "text_content", "") or ""
     return _md_cleanup(text)
 
 def xlsx_to_md_bytes(data: bytes) -> str:
-    """
-    Pandas → vraies tables Markdown (une table par feuille).
-    Remplace NaN, ajoute le titre de feuille.
-    """
     bio = io.BytesIO(data)
     xls = pd.ExcelFile(bio)
     out = []
     for sheet in xls.sheet_names:
-        df = pd.read_excel(xls, sheet_name=sheet, dtype=str)  # str pour ne rien perdre
+        df = pd.read_excel(xls, sheet_name=sheet, dtype=str)
         df = df.where(df.notna(), "")
         tbl = df.to_markdown(index=False, tablefmt="github")
         out.append(f"### Feuille : {sheet}\n\n{tbl}\n")
     return _md_cleanup("\n".join(out))
 
 def csv_to_md_bytes(data: bytes) -> str:
-    """
-    Détecteur simple et Pandas → table Markdown.
-    """
     bio = io.BytesIO(data)
     try:
         df = pd.read_csv(bio, sep=None, engine="python", dtype=str)
@@ -667,7 +698,7 @@ def csv_to_md_bytes(data: bytes) -> str:
     return _md_cleanup(tbl)
 
 # ---------------------------
-# Mini interface (inchangée, juste version)
+# Mini interface (dark)
 # ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
@@ -678,16 +709,9 @@ HTML_PAGE = r'''<!doctype html>
   <style>
     :root{
       color-scheme: dark;
-      --bg: #0b0f14;
-      --bg2: #0e141b;
-      --card: rgba(255,255,255,0.06);
-      --card-border: rgba(255,255,255,0.08);
-      --text: #e6edf3;
-      --muted: #9fb0bf;
-      --accent: #63b3ff;
-      --accent-2: #8f7aff;
-      --ok: #58d68d;
-      --err: #ff6b6b;
+      --bg: #0b0f14; --bg2: #0e141b; --card: rgba(255,255,255,0.06);
+      --card-border: rgba(255,255,255,0.08); --text: #e6edf3; --muted: #9fb0bf;
+      --accent: #63b3ff; --accent-2: #8f7aff; --ok: #58d68d; --err: #ff6b6b;
       --shadow: 0 6px 24px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.03);
       --radius: 16px;
     }
@@ -700,8 +724,7 @@ HTML_PAGE = r'''<!doctype html>
         radial-gradient(1000px 600px at 20% -10%, #183a58 0%, transparent 60%),
         radial-gradient(900px 500px at 120% 10%, #3b2d6a 0%, transparent 55%),
         linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
-      background-attachment: fixed;
-      line-height:1.55; padding:32px 20px 40px;
+      background-attachment: fixed; line-height:1.55; padding:32px 20px 40px;
     }
     h1{margin:0 0 .35rem 0; font-size:1.65rem; letter-spacing:.2px}
     .sub{color:var(--muted); font-size:.95rem; margin-bottom:18px}
@@ -742,7 +765,7 @@ HTML_PAGE = r'''<!doctype html>
   <div class="container">
     <div class="hero">
       <h1>MarkItDown — Conversion</h1>
-      <div class="sub">PDF/Images → Markdown hiérarchisé (+ OCR). DOCX/XLSX/CSV → Markdown propre (tables, listes). Résumé Azure en option.</div>
+      <div class="sub">PDF/Images → Markdown hiérarchisé (+ OCR). DOCX/XLSX/CSV → Markdown propre (tables). Résumé Azure en option.</div>
     </div>
 
     <div class="card">
@@ -845,7 +868,7 @@ fetch("/config").then(r=>r.ok?r.json():null).then(j=>{
   fi.addEventListener("change", ()=> showMeta(fi.files[0]));
 })();
 
-// Timer/counters/ui unchanged...
+// Timer & actions
 let timerId = null, t0 = 0;
 function startTimer(){ stopTimer(); t0 = performance.now(); timerId = setInterval(()=>{
   const secs = (performance.now() - t0)/1000;
@@ -932,13 +955,10 @@ async def convert(
 ):
     """
     Règles:
-    - PDF:
-      * Plugins + Forcer OCR (et OCR activé) -> pipeline PyMuPDF inline amélioré (titres/listes/tables/ocr/images)
-      * Sinon -> MarkItDown comme avant (+ cleanup)
-    - IMG:
-      * OCR image + base64 si besoin
-    - DOCX / XLSX / CSV:
-      * Conversions dédiées (Pandas/Mammoth) → Markdown propre
+    - DOCX/XLSX/CSV : pipelines dédiés
+    - PDF + (plugins & force_ocr & OCR_ENABLED) : pipeline PyMuPDF inline amélioré
+    - Sinon : MarkItDown + cleanup
+    - Images seules : OCR + embed conditionnel
     """
     try:
         t_start = time.perf_counter()
@@ -950,22 +970,21 @@ async def convert(
         if not content:
             raise HTTPException(status_code=400, detail="Fichier vide")
 
-        # Save input
         in_path = None
         if SAVE_UPLOADS:
             in_path = os.path.join(UPLOAD_DIR, file.filename)
             with open(in_path, "wb") as f:
                 f.write(content)
 
-        is_pdf = guess_is_pdf(file.filename, file.content_type)
-        is_img = guess_is_image(file.filename, file.content_type)
+        is_pdf  = guess_is_pdf(file.filename, file.content_type)
+        is_img  = guess_is_image(file.filename, file.content_type)
         is_docx = guess_is_docx(file.filename)
         is_xlsx = guess_is_xlsx(file.filename)
         is_csv  = guess_is_csv(file.filename)
 
         metadata: Dict[str,Any] = {}
 
-        # === DOCX/XLSX/CSV — conversions dédiées
+        # DOCX/XLSX/CSV
         if is_docx:
             markdown = docx_to_md_bytes(content)
 
@@ -975,13 +994,13 @@ async def convert(
         elif is_csv:
             markdown = csv_to_md_bytes(content)
 
-        # === PDF
+        # PDF — pipeline inline amélioré
         elif is_pdf and use_plugins and force_ocr and OCR_ENABLED:
             markdown, meta_pdf = render_pdf_markdown_inline(content)
             metadata.update(meta_pdf)
 
         else:
-            # MarkItDown générique (PDF ou autres) + cleanup
+            # MarkItDown générique
             md_engine = MarkItDown(enable_plugins=use_plugins, docintel_endpoint=docintel_endpoint)
             result = md_engine.convert_stream(io.BytesIO(content), file_name=file.filename)
 
@@ -1000,8 +1019,8 @@ async def convert(
                 if EMBED_IMAGES in ("all", "ocr_only") and (not ocr_text or score < OCR_SCORE_GOOD_ENOUGH):
                     try:
                         with Image.open(io.BytesIO(content)) as im:
-                            im = _pil_resize_max(im, IMG_MAX_WIDTH)
-                            data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+                            im_embed = _pil_resize_max(im, IMG_MAX_WIDTH)
+                            data_uri = _pil_to_base64(im_embed, IMG_FORMAT, IMG_JPEG_QUALITY)
                             markdown += f'\n\n![{IMG_ALT_PREFIX}]({data_uri})\n'
                     except Exception:
                         pass
@@ -1045,7 +1064,7 @@ async def convert(
             else:
                 metadata["azure_summary"] = "[Azure OpenAI non configuré]"
 
-        # Durée côté serveur
+        # Durée
         metadata["duration_sec"] = round(time.perf_counter() - t_start, 3)
 
         if SAVE_UPLOADS and in_path:
