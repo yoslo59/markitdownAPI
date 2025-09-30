@@ -1,15 +1,20 @@
 FROM python:3.12-slim
 
-# Binaries utiles (OCR + tests HTTP)
+# OS deps (OCR + OpenCV + fonts)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     tesseract-ocr \
     tesseract-ocr-fra \
     tesseract-ocr-eng \
+    libgl1 \
     curl \
  && rm -rf /var/lib/apt/lists/*
 
-# Dépendances Python (ajout: pymupdf, pytesseract, pillow)
+# Python deps
+# - markitdown[all] : plugins DOCX/XLSX/HTML
+# - pandas+tabulate : tableaux Markdown (xlsx/csv + tables ASCII)
+# - pdfplumber (optionnel) : extraction tables PDF si besoin
+# - opencv-python-headless : prétraitement OCR (binarisation/deskew)
 RUN pip install --no-cache-dir \
     "markitdown[all]" \
     fastapi \
@@ -18,7 +23,11 @@ RUN pip install --no-cache-dir \
     openai \
     pymupdf \
     pytesseract \
-    pillow
+    pillow \
+    opencv-python-headless \
+    pandas \
+    tabulate \
+    pdfplumber
 
 WORKDIR /app
 COPY main.py /app/main.py
