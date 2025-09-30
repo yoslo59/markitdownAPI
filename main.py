@@ -2,6 +2,7 @@ import os
 import io
 import re
 import base64
+import time
 from typing import Optional, Tuple, List, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -486,78 +487,253 @@ HTML_PAGE = r'''<!doctype html>
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>MarkItDown UI</title>
+  <title>MarkItDown — Conversion</title>
   <style>
     :root{color-scheme: light dark;}
-    body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial; padding:24px; max-width: 980px; margin:auto; line-height:1.45}
-    h1{margin-bottom:0.5rem}
-    .card{border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin-top:16px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
+    *{box-sizing:border-box}
+    body{
+      margin:0;padding:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial;
+      background:
+        radial-gradient(1200px 600px at -10% -10%, #7dd3fc33 0, transparent 60%),
+        radial-gradient(1200px 600px at 110% -10%, #a78bfa33 0, transparent 60%),
+        radial-gradient(1200px 600px at 50% 120%, #34d39922 0, transparent 60%),
+        linear-gradient(180deg, #0b0f18, #0b0f18);
+      color:#e5e7eb;
+    }
+    .wrap{max-width:1100px;margin:0 auto;padding:32px}
+    header{
+      display:flex;gap:16px;align-items:center;justify-content:space-between;margin-bottom:20px
+    }
+    .brand{
+      display:flex;gap:12px;align-items:center
+    }
+    .logo{
+      width:40px;height:40px;border-radius:12px;
+      background: linear-gradient(135deg,#22d3ee,#a78bfa);
+      box-shadow:0 6px 30px #22d3ee55, inset 0 0 20px #ffffff22;
+    }
+    h1{margin:0;font-weight:800;letter-spacing:.3px}
+    .sub{opacity:.8;margin-top:4px}
+
+    .grid{
+      display:grid;gap:18px;
+      grid-template-columns: 1fr;
+    }
+    @media(min-width:1000px){ .grid{ grid-template-columns: 420px 1fr; } }
+
+    .card{
+      background: linear-gradient(180deg, #0f1422dd, #0a0f1add);
+      border:1px solid #334155;
+      border-radius:16px; padding:18px;
+      box-shadow:
+        0 20px 60px #00000066,
+        inset 0 1px 0 #ffffff0f;
+      backdrop-filter: blur(6px);
+    }
     .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
     label{font-weight:600}
-    button{padding:10px 16px;border:1px solid #111;border-radius:10px;background:#111;color:#fff;cursor:pointer}
-    button:disabled{opacity:.5;cursor:not-allowed}
-    textarea{width:100%;min-height:260px;padding:12px;border-radius:10px;border:1px solid #e5e7eb;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace}
-    .muted{color:#6b7280;font-size:12px}
-    input[type="checkbox"]{transform: scale(1.2);}
-    a#download{padding:10px 16px;border:1px solid #111;border-radius:10px;text-decoration:none}
-    input[type="text"]{padding:8px 10px;border:1px solid #e5e7eb;border-radius:10px;min-width:420px}
+    .muted{color:#94a3b8;font-size:12px}
+
+    .btn{
+      appearance:none;border:0;border-radius:12px;padding:10px 16px;
+      font-weight:700;letter-spacing:.3px;cursor:pointer;
+      color:#0b0f18;background:#e5e7eb;
+      transition: transform .06s ease, box-shadow .2s ease, opacity .2s ease;
+      box-shadow: 0 10px 30px #22d3ee33, inset 0 -2px 0 #00000011;
+    }
+    .btn:hover{transform: translateY(-1px)}
+    .btn:disabled{opacity:.5;cursor:not-allowed}
+
+    input[type="checkbox"]{transform: scale(1.15); accent-color:#22d3ee}
+
+    input[type="text"]{
+      color:#e5e7eb;background:#0b1220;border:1px solid #334155;
+      border-radius:12px;padding:10px 12px;min-width:360px;outline:none
+    }
+    input[type="text"]::placeholder{color:#64748b}
+
+    textarea{
+      width:100%;min-height:280px;padding:12px;border-radius:12px;
+      background:#0b1220;border:1px solid #334155;color:#e5e7eb;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      line-height:1.5;
+    }
+
+    .drop{
+      border:1.5px dashed #334155;border-radius:14px;padding:14px;
+      background:#0b1220; color:#cbd5e1; text-align:center;
+      transition:border-color .2s ease, background .2s ease;
+    }
+    .drop.drag{ border-color:#22d3ee; background:#0b122055; }
+
+    .kpi{
+      display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-top:10px
+    }
+    .chip{
+      border:1px solid #334155;border-radius:999px;padding:6px 10px;
+      background:#0b1220; font-size:12px; color:#cbd5e1
+    }
+
+    .timer{
+      font-variant-numeric: tabular-nums; font-weight:800; letter-spacing:.5px;
+      padding:8px 10px;border-radius:10px;
+      background: #0b1220; border:1px solid #334155; color:#e2e8f0;
+      box-shadow: inset 0 1px 0 #ffffff0f;
+      min-width: 120px; text-align:center
+    }
+
+    .status{
+      display:flex; align-items:center; gap:8px; margin-top:10px
+    }
+    .dot{
+      width:10px;height:10px;border-radius:999px;background:#22d3ee;box-shadow:0 0 14px #22d3ee99
+    }
+    .spin{
+      width:16px;height:16px;border:2px solid #94a3b855;border-top-color:#22d3ee;border-radius:50%;
+      animation:spin 1s linear infinite
+    }
+    @keyframes spin{ to{ transform:rotate(360deg)} }
+
+    .download{
+      display:inline-flex;align-items:center;gap:8px;margin-left:8px;
+      padding:10px 14px;border-radius:12px;border:1px solid #334155;
+      color:#e5e7eb;text-decoration:none;background:#0b1220;
+    }
+
+    .area-title{font-weight:700;margin-bottom:8px;opacity:.9}
   </style>
 </head>
 <body>
-  <h1>MarkItDown — Conversion</h1>
-  <p class="muted">Plugins seul : MarkItDown. Plugins + Forcer OCR (PDF) : texte + OCR / images in-place.</p>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <h1>MarkItDown — Conversion</h1>
+          <div class="sub">Convertit (PDF, DOCX, PPTX, XLSX, HTML, images) → Markdown. Plugins, OCR, images base64.</div>
+        </div>
+      </div>
+    </header>
 
-  <div class="card">
-    <div class="row">
-      <label for="file">Fichier :</label>
-      <input id="file" type="file" />
-    </div>
-    <div class="row" style="margin-top:8px">
-      <label for="plugins">Activer plugins MarkItDown</label>
-      <input id="plugins" type="checkbox" />
-      <label for="llm">Résumé Azure LLM</label>
-      <input id="llm" type="checkbox" />
-      <label for="forceocr">Forcer OCR</label>
-      <input id="forceocr" type="checkbox" />
-    </div>
-    <div class="row" style="margin-top:8px; gap:8px; align-items:baseline;">
-      <label for="di">Endpoint Azure Document Intelligence</label>
-      <input id="di" type="text" placeholder="https://<resource>.cognitiveservices.azure.com/"/>
-      <span class="muted">Optionnel (MarkItDown)</span>
-    </div>
-    <div class="row" style="margin-top:8px">
-      <button id="convert">Convertir</button>
-      <a id="download" download="sortie.md" style="display:none;margin-left:8px">Télécharger Markdown</a>
-    </div>
-    <p id="status" class="muted" style="margin-top:8px"></p>
-  </div>
+    <div class="grid">
+      <!-- Panneau gauche (upload + options) -->
+      <div class="card">
+        <div class="area-title">Document</div>
+        <div id="drop" class="drop">
+          <div><strong>Glisse-dépose</strong> un fichier ici ou</div>
+          <div style="margin-top:10px">
+            <input id="file" type="file" />
+          </div>
+          <div id="fname" class="muted" style="margin-top:8px"></div>
+        </div>
 
-  <div class="card">
-    <label>Markdown</label>
-    <textarea id="md"></textarea>
-  </div>
+        <div style="height:10px"></div>
+        <div class="area-title">Options</div>
+        <div class="row" style="gap:14px">
+          <label for="plugins">Activer plugins MarkItDown</label>
+          <input id="plugins" type="checkbox" />
+        </div>
+        <div class="row" style="gap:14px;margin-top:6px">
+          <label for="forceocr">Forcer OCR</label>
+          <input id="forceocr" type="checkbox" />
+        </div>
+        <div class="row" style="gap:14px;margin-top:6px">
+          <label for="llm">Résumé Azure LLM</label>
+          <input id="llm" type="checkbox" />
+        </div>
+        <div class="row" style="gap:10px;align-items:baseline;margin-top:10px">
+          <label for="di" style="min-width:250px">Endpoint Azure Document Intelligence</label>
+          <input id="di" type="text" placeholder="https://<resource>.cognitiveservices.azure.com/"/>
+        </div>
 
-  <div class="card">
-    <label>Métadonnées (JSON)</label>
-    <textarea id="meta" style="min-height:140px"></textarea>
+        <div class="kpi">
+          <div class="timer" id="timer">00:00.0</div>
+          <div id="serverTime" class="chip" style="display:none"></div>
+          <div id="sizeInfo" class="chip" style="display:none"></div>
+        </div>
+
+        <div class="row" style="margin-top:14px">
+          <button class="btn" id="convert">Convertir</button>
+          <a class="download" id="download" download="sortie.md" style="display:none">Télécharger Markdown</a>
+        </div>
+
+        <div class="status">
+          <div id="spin" class="spin" style="display:none"></div>
+          <div id="status" class="muted"></div>
+        </div>
+      </div>
+
+      <!-- Panneau droit (résultats) -->
+      <div class="card">
+        <div class="area-title">Markdown</div>
+        <textarea id="md"></textarea>
+      </div>
+
+      <div class="card" style="grid-column:1/-1">
+        <div class="area-title">Métadonnées (JSON)</div>
+        <textarea id="meta" style="min-height:160px"></textarea>
+      </div>
+    </div>
   </div>
 
 <script>
-const $ = (id)=>document.getElementById(id);
+const $ = id => document.getElementById(id);
 const endpoint = "/convert";
 
+// préremplir l’endpoint DI si dispo
 fetch("/config").then(r=>r.ok?r.json():null).then(j=>{
   if(j && j.docintel_default){ $("di").value = j.docintel_default; }
 }).catch(()=>{});
 
+// drag & drop
+(() => {
+  const drop = $("drop"), input = $("file"), fname = $("fname");
+  const showName = f => { if(!f) return; fname.textContent = `${f.name} — ${(f.size/1024/1024).toFixed(2)} Mo`; $("sizeInfo").style.display="inline-block"; $("sizeInfo").textContent = `${(f.size/1024/1024).toFixed(2)} Mo`; };
+  drop.addEventListener("dragover", e=>{e.preventDefault(); drop.classList.add("drag");});
+  drop.addEventListener("dragleave", ()=>drop.classList.remove("drag"));
+  drop.addEventListener("drop", e=>{
+    e.preventDefault(); drop.classList.remove("drag");
+    if(e.dataTransfer.files && e.dataTransfer.files[0]){
+      input.files = e.dataTransfer.files;
+      showName(input.files[0]);
+    }
+  });
+  input.addEventListener("change", ()=> showName(input.files[0]));
+})();
+
+// chrono
+let tStart=0, tTick=null;
+function resetTimer(){ $("timer").textContent="00:00.0"; if(tTick){ clearInterval(tTick); tTick=null; } }
+function startTimer(){
+  tStart = performance.now();
+  resetTimer();
+  tTick = setInterval(()=>{
+    const ms = performance.now()-tStart;
+    const s = Math.floor(ms/1000);
+    const d = (ms%1000)/100;
+    const m = Math.floor(s/60);
+    const ss = (s%60).toString().padStart(2,'0');
+    $("timer").textContent = `${m.toString().padStart(2,'0')}:${ss}.${Math.floor(d)}`;
+  }, 100);
+}
+function stopTimer(){ if(tTick){ clearInterval(tTick); tTick=null; } }
+
 $("convert").onclick = async () => {
   const f = $("file").files[0];
   if(!f){ alert("Choisis un fichier."); return; }
+
+  // reset UI
   $("convert").disabled = true;
-  $("status").textContent = "Conversion en cours...";
+  $("spin").style.display = "inline-block";
+  $("status").textContent = "Conversion en cours…";
   $("md").value = "";
   $("meta").value = "";
   $("download").style.display = "none";
+  $("serverTime").style.display = "none";
+
+  // chrono client ON
+  startTimer();
 
   const fd = new FormData();
   fd.append("file", f);
@@ -570,19 +746,35 @@ $("convert").onclick = async () => {
     const res = await fetch(endpoint, { method:"POST", body: fd });
     if(!res.ok){ throw new Error("HTTP "+res.status); }
     const json = await res.json();
+
     $("md").value = json.markdown || "";
     $("meta").value = JSON.stringify(json.metadata || {}, null, 2);
+    $("status").textContent = "OK";
 
+    // Download du MD
     const blob = new Blob([$("md").value], {type:"text/markdown;charset=utf-8"});
     const url  = URL.createObjectURL(blob);
     const a = $("download");
     a.href = url;
     a.download = (json.output_filename || "sortie.md");
-    a.style.display = "inline-block";
-    $("status").textContent = "OK";
+    a.style.display = "inline-flex";
+
+    // chrono client OFF
+    stopTimer();
+
+    // durée serveur si dispo
+    if(typeof json.duration_ms === "number"){
+      $("serverTime").style.display = "inline-block";
+      $("serverTime").textContent = `Serveur: ${(json.duration_ms/1000).toFixed(2)} s`;
+    }else if(json.metadata && typeof json.metadata.duration_ms==="number"){
+      $("serverTime").style.display = "inline-block";
+      $("serverTime").textContent = `Serveur: ${(json.metadata.duration_ms/1000).toFixed(2)} s`;
+    }
   }catch(e){
+    stopTimer();
     $("status").textContent = "Erreur : " + (e && e.message ? e.message : e);
   }finally{
+    $("spin").style.display = "none";
     $("convert").disabled = false;
   }
 };
@@ -604,6 +796,7 @@ def get_config():
 # ---------------------------
 @app.post("/convert")
 async def convert(
+    t0 = time.time()
     file: UploadFile = File(...),
     use_plugins: bool = Form(False),
     docintel_endpoint: Optional[str] = Form(None),
@@ -712,7 +905,8 @@ async def convert(
             metadata["saved_input_path"] = in_path
         if SAVE_OUTPUTS and out_path:
             metadata["saved_output_path"] = out_path
-
+        duration_ms = int((time.time() - t0) * 1000)
+        metadata["duration_ms"] = duration_ms
         return JSONResponse({
             "filename": file.filename,
             "output_filename": out_name if SAVE_OUTPUTS else None,
