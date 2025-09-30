@@ -245,7 +245,7 @@ $("convert").onclick = async () => {
     a.style.display = "inline-block";
     $("status").textContent = "OK";
   }catch(e){
-    $("status").textContent = "Erreur : " + e.message";
+    $("status").textContent = "Erreur : " + (e && e.message ? e.message : e);
   }finally{
     $("convert").disabled = false;
   }
