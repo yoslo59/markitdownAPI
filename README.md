@@ -26,7 +26,6 @@ Il inclut :
 - [Images base64 — Stratégies](#images-base64--stratégies)
 - [Azure OpenAI — Résumé](#azure-openai--résumé)
 - [Performance : conseils](#performance--conseils)
-- [Sécurité](#sécurité)
 - [Dépannage](#dépannage)
 - [Feuille de route](#feuille-de-route)
 - [Licence](#licence)
