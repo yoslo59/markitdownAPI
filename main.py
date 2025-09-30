@@ -2,7 +2,7 @@ import os
 import io
 import re
 import base64
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from markitdown import MarkItDown
 from openai import AzureOpenAI
 
-# OCR
+# OCR libs
 import pytesseract
 from PIL import Image, ImageOps, ImageFilter
 import fitz  # PyMuPDF
@@ -30,26 +30,33 @@ AZURE_KEY        = os.getenv("AZURE_OPENAI_KEY", "").strip()
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "o4-mini").strip()
 AZURE_API_VER    = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview").strip()
 
-# OCR (tunable)
+# OCR (tunable sans rebuild)
 OCR_ENABLED        = os.getenv("OCR_ENABLED", "true").lower() == "true"
 OCR_LANGS          = os.getenv("OCR_LANGS", "fra+eng").strip()
 OCR_DPI            = int(os.getenv("OCR_DPI", "350"))
-OCR_MAX_PAGES      = int(os.getenv("OCR_MAX_PAGES", "200"))  # laisse grand, on arrêtera au doc.page_count
+OCR_MAX_PAGES      = int(os.getenv("OCR_MAX_PAGES", "25"))
 OCR_MIN_CHARS      = int(os.getenv("OCR_MIN_CHARS", "500"))
+OCR_MODE           = os.getenv("OCR_MODE", "append").strip()
 OCR_KEEP_SPACES    = os.getenv("OCR_KEEP_SPACES", "true").lower() == "true"
 OCR_TWO_PASS       = os.getenv("OCR_TWO_PASS", "true").lower() == "true"
-OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,4,11").split(",")]  # 6=block, 4=columns, 11=sparse
+OCR_TABLE_MODE     = os.getenv("OCR_TABLE_MODE", "true").lower() == "true"
+OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,4,11").split(",")]     # 6=block, 4=columns, 11=sparse
 OCR_DPI_CANDIDATES = [int(x) for x in os.getenv("OCR_DPI_CANDIDATES", "300,350,400").split(",")]
+
+# Short-circuit : si on atteint ce score, on arrête la recherche multi-DPI/PSM pour gagner du temps
 OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
 
 # Embedding images base64
-EMBED_IMAGES       = os.getenv("EMBED_IMAGES", "ocr_only").strip()   # none | ocr_only | all
+# none      : n’embarque aucune image
+# ocr_only  : embarque les images uniquement si l’OCR n’est pas exploitable (court/bruyant)
+# all       : embarque toutes les images du PDF
+EMBED_IMAGES       = os.getenv("EMBED_IMAGES", "ocr_only").strip()  # none | ocr_only | all
 IMG_FORMAT         = os.getenv("IMG_FORMAT", "png").strip().lower()  # png | jpeg
 IMG_JPEG_QUALITY   = int(os.getenv("IMG_JPEG_QUALITY", "85"))
-IMG_MAX_WIDTH      = int(os.getenv("IMG_MAX_WIDTH", "1400"))
+IMG_MAX_WIDTH      = int(os.getenv("IMG_MAX_WIDTH", "1400"))         # resize max (px), 0 = no limit
 IMG_ALT_PREFIX     = os.getenv("IMG_ALT_PREFIX", "Capture").strip()
 
-# (Optionnel) Azure Document Intelligence pour MarkItDown (non utilisé pour PDF ici)
+# (Optionnel) Azure Document Intelligence
 DEFAULT_DOCINTEL_ENDPOINT = os.getenv("DEFAULT_DOCINTEL_ENDPOINT", "").strip()
 
 # Dossiers persistants
@@ -59,7 +66,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="3.1")
+app = FastAPI(title="MarkItDown API", version="1.9")
 
 app.add_middleware(
     CORSMiddleware,
@@ -79,7 +86,7 @@ def get_azure_client() -> Optional[AzureOpenAI]:
     return None
 
 # ---------------------------
-# Utils
+# Helpers génériques
 # ---------------------------
 def guess_is_pdf(filename: str, content_type: Optional[str]) -> bool:
     if content_type and content_type.lower() in ("application/pdf", "pdf"):
@@ -91,48 +98,52 @@ def guess_is_image(filename: str, content_type: Optional[str]) -> bool:
         return True
     return any(filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"))
 
-def _md_escape(s: str) -> str:
-    return s.replace("\r", "")
-
 # ---------------------------
-# OCR helpers (Tesseract)
+# Helpers OCR
 # ---------------------------
-_table_chars = re.compile(r"[|+\-=_]{3,}")
+_table_chars = re.compile(r"[|+\-=_]{3,}")  # heuristique ASCII
 
-def _tess_config(psm: str, keep_spaces: bool) -> str:
-    cfg = f"--psm {psm} --oem 1"
+def _tess_config(psm: str, keep_spaces: bool, table_mode: bool) -> str:
+    cfg = f"--psm {psm} --oem 1"  # LSTM
     if keep_spaces:
         cfg += " -c preserve_interword_spaces=1"
+    if table_mode:
+        cfg += " -c tessedit_write_images=false"
     return cfg
 
 def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
     g = ImageOps.grayscale(im)
     g = ImageOps.autocontrast(g, cutoff=1)
     g = g.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=3))
+    # binarisation douce
     g = g.point(lambda p: 255 if p > 190 else (0 if p < 110 else p))
     return g
 
 def _score_text_for_table(txt: str) -> float:
+    """Score simple favorisant tableaux/monospace, pénalise bruit évident."""
     if not txt:
         return 0.0
     lines = txt.splitlines()
     n = max(1, len(lines))
     pipes = sum(l.count("|") for l in lines)
+    plus  = sum(l.count("+") for l in lines)
+    dashes= sum(l.count("-") for l in lines)
     ascii_blocks = sum(1 for l in lines if _table_chars.search(l))
-    noise = sum(1 for l in lines if "nnn" in l or "—" in l or "$---" in l or "Se ne" in l)
-    return (pipes*1.0 + ascii_blocks*2.0)/n - noise*0.25 + len(txt)/6000.0
+    noise = sum(1 for l in lines if "nnn" in l or "Se ne" in l or "—" in l or "$-----" in l)
+    return (pipes*1.0 + plus*0.6 + dashes*0.3 + ascii_blocks*2.0)/n - noise*0.25 + len(txt)/5000.0
 
-def _wrap_ascii_tables(txt: str) -> str:
+def _wrap_tables_as_code(txt: str) -> str:
+    """Emballe blocs ASCII en ```text``` pour garder l’alignement Markdown."""
     if not txt:
         return txt
     out, buf, in_blk = [], [], False
     for line in txt.splitlines():
-        looks_table = _table_chars.search(line) is not None or line.strip().startswith("|")
-        if looks_table and not in_blk:
+        is_tbl = _table_chars.search(line) is not None or line.strip().startswith("|")
+        if is_tbl and not in_blk:
             in_blk = True
             out.append("```text")
             buf = []
-        if in_blk and not looks_table and buf:
+        if in_blk and not is_tbl and buf:
             out.extend(buf)
             out.append("```")
             in_blk = False
@@ -148,38 +159,84 @@ def _wrap_ascii_tables(txt: str) -> str:
         out.append("```")
     return "\n".join(out)
 
-def ocr_pil_best(im: Image.Image) -> Tuple[str, float]:
+def _ocr_image_best(im: Image.Image, langs: str) -> Tuple[str, float]:
+    """Essaie plusieurs PSM, 2 passes (brute + prétraitée). Short-circuit si score OK."""
     if im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
     best_txt, best_score = "", -1e9
     for psm in OCR_PSMS:
-        cfg = _tess_config(psm, OCR_KEEP_SPACES)
-        t1 = pytesseract.image_to_string(im, lang=OCR_LANGS, config=cfg) or ""
+        cfg = _tess_config(psm, OCR_KEEP_SPACES, OCR_TABLE_MODE)
+        # Pass brute
+        t1 = pytesseract.image_to_string(im, lang=langs, config=cfg) or ""
         s1 = _score_text_for_table(t1)
         cand_txt, cand_score = t1, s1
+        # Pass prétraitée
         if OCR_TWO_PASS:
             im2 = _preprocess_for_ocr(im)
-            t2 = pytesseract.image_to_string(im2, lang=OCR_LANGS, config=cfg) or ""
+            t2 = pytesseract.image_to_string(im2, lang=langs, config=cfg) or ""
             s2 = _score_text_for_table(t2)
             if s2 > cand_score:
                 cand_txt, cand_score = t2, s2
         if cand_score > best_score:
             best_txt, best_score = cand_txt, cand_score
+        # short-circuit si suffisant
         if best_score >= OCR_SCORE_GOOD_ENOUGH:
             break
-    return _wrap_ascii_tables(best_txt.strip()), best_score
+    return best_txt.strip(), best_score
 
-def resize_max(im: Image.Image, max_w: int) -> Image.Image:
+def ocr_image_bytes(img_bytes: bytes, langs: str) -> Tuple[str, float]:
+    with Image.open(io.BytesIO(img_bytes)) as im:
+        txt, score = _ocr_image_best(im, langs)
+        return _wrap_tables_as_code(txt), score
+
+def _raster_pdf_page(page, dpi: int) -> Image.Image:
+    scale = dpi / 72.0
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+def ocr_pdf_bytes(pdf_bytes: bytes, langs: str, dpi: int, max_pages: int) -> Tuple[str, int, List[float]]:
+    """Multi-DPI/PSM per page, returns (markdown_text, pages_done, scores_list)."""
+    out = []
+    pages_done = 0
+    scores: List[float] = []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        total_pages = doc.page_count
+        for i in range(min(total_pages, max_pages)):
+            page = doc.load_page(i)
+            best_txt, best_score = "", -1e9
+            # multi-DPI par page avec short-circuit
+            for d in OCR_DPI_CANDIDATES:
+                im = _raster_pdf_page(page, d)
+                txt, score = _ocr_image_best(im, langs)
+                if score > best_score:
+                    best_txt, best_score = txt, score
+                if best_score >= OCR_SCORE_GOOD_ENOUGH:
+                    break
+            scores.append(best_score)
+            if best_txt.strip():
+                out.append(f"\n\n## Page {i+1}\n\n{_wrap_tables_as_code(best_txt)}")
+            pages_done += 1
+    finally:
+        doc.close()
+    return ("\n".join(out).strip(), pages_done, scores)
+
+# ---------------------------
+# Extraction/embedding images
+# ---------------------------
+def _pil_resize_max(im: Image.Image, max_w: int) -> Image.Image:
     if max_w and im.width > max_w:
-        r = max_w / im.width
-        return im.resize((max_w, int(im.height*r)), Image.LANCZOS)
+        ratio = max_w / im.width
+        new_h = int(im.height * ratio)
+        return im.resize((max_w, new_h), Image.LANCZOS)
     return im
 
-def pil_to_b64(im: Image.Image) -> str:
+def _pil_to_base64(im: Image.Image, fmt: str = "png", quality: int = 85) -> str:
     buf = io.BytesIO()
-    if IMG_FORMAT in ("jpeg", "jpg"):
+    if fmt.lower() == "jpeg" or fmt.lower() == "jpg":
         im = im.convert("RGB")
-        im.save(buf, format="JPEG", quality=IMG_JPEG_QUALITY, optimize=True)
+        im.save(buf, format="JPEG", quality=quality, optimize=True)
         mime = "image/jpeg"
     else:
         im.save(buf, format="PNG", optimize=True)
@@ -187,247 +244,36 @@ def pil_to_b64(im: Image.Image) -> str:
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
-# ---------------------------
-# PyMuPDF helpers (blocs PDF)
-# ---------------------------
-BulletStart = re.compile(r"^\s*([•\-–‣●◦▪]|(\d+[\.\)]))\s+")
-HasLetter = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]")
-
-def _get_page_items(page: fitz.Page) -> List[Dict[str, Any]]:
-    """Retourne items ordonnés: text / image / table avec bbox."""
-    items: List[Dict[str, Any]] = []
-
-    # 1) Texte & images depuis rawdict (avec bbox)
-    rd = page.get_text("rawdict")
-    for b in rd.get("blocks", []):
-        tp = b.get("type", 0)
-        bbox = tuple(b.get("bbox", (0,0,0,0)))
-        if tp == 0:
-            # reconstruire texte brut du bloc + récupérer tailles de spans
-            lines, sizes, fonts = [], [], []
-            for l in b.get("lines", []):
-                seg = []
-                for s in l.get("spans", []):
-                    t = s.get("text", "")
-                    if t:
-                        seg.append(t)
-                        sizes.append(float(s.get("size", 0)))
-                        f = s.get("font", "")
-                        if f: fonts.append(f)
-                if seg:
-                    lines.append("".join(seg))
-            txt = "\n".join(lines).strip()
-            if txt:
-                items.append({"kind":"text", "bbox":bbox, "text":txt, "sizes":sizes, "fonts":fonts})
-        elif tp == 1:
-            xref = None
-            imginfo = b.get("image")
-            if isinstance(imginfo, dict):
-                xref = imginfo.get("xref")
-            items.append({"kind":"image", "bbox":bbox, "xref":xref})
-
-    # 2) Tables détectées
-    try:
-        tbls = page.find_tables()
-        for t in tbls.tables:
-            items.append({"kind":"table", "bbox":tuple(t.bbox), "table": t.extract()})
-    except Exception:
-        pass
-
-    # 3) Tri de lecture (haut-gauche → bas-droite)
-    def key_it(it):
-        x0,y0,x1,y1 = it["bbox"]
-        return (y0, x0, y1, x1)
-    items.sort(key=key_it)
-
-    # 4) Supprimer le texte qui tombe "dans" des tables (pour éviter le doublon)
-    table_rects = [fitz.Rect(*it["bbox"]) for it in items if it["kind"]=="table"]
-    if table_rects:
-        kept = []
-        for it in items:
-            if it["kind"]=="text":
-                rect = fitz.Rect(*it["bbox"])
-                if any(r.contains(rect) or r.intersects(rect) for r in table_rects):
-                    continue
-            kept.append(it)
-        items = kept
-
-    return items
-
-def _sizes_stats(items: List[List[Dict[str,Any]]]) -> float:
-    """Renvoie la taille de police 'corps' (médiane des spans contenant des lettres) sur tout le document."""
-    all_sizes = []
-    for page_items in items:
-        for it in page_items:
-            if it["kind"]=="text" and it.get("sizes"):
-                if HasLetter.search(it.get("text","")):
-                    all_sizes.extend(it["sizes"])
-    if not all_sizes:
-        return 12.0
-    all_sizes.sort()
-    mid = len(all_sizes)//2
-    return float(all_sizes[mid]) if len(all_sizes)%2==1 else float((all_sizes[mid-1]+all_sizes[mid])/2)
-
-def _classify_heading(line: str, block_sizes: List[float], body_size: float, fonts: List[str]) -> Optional[str]:
-    """Retourne 'H1'/'H2'/'H3' ou None selon taille / bold / présence de lettres."""
-    if not HasLetter.search(line):
-        return None
-    if not block_sizes:
-        return None
-    max_size = max(block_sizes)
-    # bold heuristique
-    is_bold = any("Bold" in f or "Semibold" in f or "Black" in f for f in fonts)
-    # seuils
-    if max_size >= body_size*1.7 or (is_bold and max_size >= body_size*1.5):
-        return "H1"
-    if max_size >= body_size*1.45 or (is_bold and max_size >= body_size*1.3):
-        return "H2"
-    if max_size >= body_size*1.25:
-        return "H3"
-    return None
-
-def _format_text_block(text: str, sizes: List[float], fonts: List[str], body_size: float) -> str:
-    """Transforme un bloc texte en Markdown (titres/listes/paragraphes)."""
-    text = _md_escape(text)
-    out: List[str] = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            out.append("")
-            continue
-        # listes (puces / numérotées)
-        m = BulletStart.match(line)
-        if m:
-            # normaliser la puce
-            core = line[m.end():].strip()
-            out.append(f"- {core}")
-            continue
-        # potentiellement un titre
-        head = _classify_heading(line, sizes, body_size, fonts)
-        if head == "H1":
-            out.append(f"# {line}")
-            continue
-        if head == "H2":
-            out.append(f"## {line}")
-            continue
-        if head == "H3":
-            out.append(f"### {line}")
-            continue
-        out.append(line)
-    return "\n".join(out)
-
-def _markdown_table_from_cells(cells: List[List[str]]) -> str:
-    if not cells or not any(row for row in cells):
+def extract_pdf_images_as_md(doc: fitz.Document, page_index: int) -> str:
+    """Extrait les images natives d'une page PDF et les retourne en Markdown base64."""
+    md_parts = []
+    page = doc.load_page(page_index)
+    imgs = page.get_images(full=True)
+    if not imgs:
         return ""
-    rows = [[(c or "").strip() for c in row] for row in cells]
-    header = rows[0]
-    body = rows[1:] if len(rows)>1 else []
-    # sécuriser pipes
-    header = [h.replace("|","\\|") for h in header]
-    body = [[c.replace("|","\\|") for c in r] for r in body]
-    md = []
-    md.append("| " + " | ".join(header) + " |")
-    md.append("| " + " | ".join(["---"]*len(header)) + " |")
-    for r in body:
-        md.append("| " + " | ".join(r) + " |")
-    return "\n".join(md)
+    for idx, img in enumerate(imgs, start=1):
+        xref = img[0]
+        try:
+            pix = fitz.Pixmap(doc, xref)
+            if pix.n >= 4:  # CMYK/with alpha -> convert to RGB
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            im = _pil_resize_max(im, IMG_MAX_WIDTH)
+            data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+            md_parts.append(f'![{IMG_ALT_PREFIX} p{page_index+1}-{idx}]({data_uri})')
+        except Exception:
+            continue
+    return "\n\n".join(md_parts)
 
-def _crop_region_image(page: fitz.Page, bbox: Tuple[float,float,float,float], dpi: int) -> Optional[Image.Image]:
-    try:
-        x0,y0,x1,y1 = bbox
-        rect = fitz.Rect(x0,y0,x1,y1)
-        zoom = dpi / 72.0
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
-        return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    except Exception:
-        return None
-
-# ---------------------------
-# Construction Markdown (PDF)
-# ---------------------------
-def build_pdf_markdown(pdf_bytes: bytes, want_text: bool, want_inline_images: bool, want_ocr: bool) -> Tuple[str, Dict[str,Any]]:
-    """
-    Construit un Markdown final en respectant l'ordre des blocs:
-      - texte → titres / listes / paragraphes
-      - table → table Markdown
-      - image → OCR in-place ou image base64 (selon score / EMBED_IMAGES)
-    want_text:       inclure le texte
-    want_inline_images: traiter et inclure les blocs image (embed / OCR)
-    want_ocr:        si True tente l’OCR sur image, sinon image seule (selon EMBED_IMAGES)
-    """
-    meta: Dict[str,Any] = {"engine":"pymupdf_layout"}
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        # Pré-collecte pour déterminer la taille "corps"
-        all_items = []
-        total_pages = doc.page_count
-        maxp = min(total_pages, OCR_MAX_PAGES)
-        for p in range(maxp):
-            all_items.append(_get_page_items(doc.load_page(p)))
-        body_size = _sizes_stats(all_items)
-        meta["body_font_size"] = body_size
-
-        pages_md = []
-        for pno in range(maxp):
-            page = doc.load_page(pno)
-            items = all_items[pno]
-            lines: List[str] = [f"## Page {pno+1}"]
-            for it in items:
-                kind = it["kind"]
-                bbox = it["bbox"]
-
-                if kind == "text" and want_text:
-                    lines.append(_format_text_block(it["text"], it.get("sizes",[]), it.get("fonts",[]), body_size))
-
-                elif kind == "table" and want_text:
-                    table = it.get("table") or {}
-                    cells = table.get("cells") if isinstance(table, dict) else None
-                    if not cells and hasattr(table, "extract"):
-                        try:
-                            cells = table.extract().get("cells")
-                        except Exception:
-                            cells = None
-                    if cells:
-                        # convert list of lists-of-strings from extract()
-                        md_tbl = _markdown_table_from_cells(cells)
-                        if md_tbl:
-                            lines.append(md_tbl)
-
-                elif kind == "image" and want_inline_images:
-                    # image native / crop bbox fallback
-                    im = None
-                    if it.get("xref"):
-                        try:
-                            pix = fitz.Pixmap(doc, it["xref"])
-                            if pix.n >= 4:
-                                pix = fitz.Pixmap(fitz.csRGB, pix)
-                            im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                        except Exception:
-                            im = None
-                    if im is None:
-                        im = _crop_region_image(page, bbox, OCR_DPI)
-                    if im is None:
-                        continue
-                    im = resize_max(im, IMG_MAX_WIDTH)
-
-                    if want_ocr and OCR_ENABLED:
-                        txt, score = ocr_pil_best(im)
-                        if txt.strip() and (score >= OCR_SCORE_GOOD_ENOUGH or len(txt) >= OCR_MIN_CHARS//4):
-                            lines.append(txt)
-                        else:
-                            if EMBED_IMAGES in ("all","ocr_only"):
-                                lines.append(f'![{IMG_ALT_PREFIX} p{pno+1}]({pil_to_b64(im)})')
-                    else:
-                        if EMBED_IMAGES != "none":
-                            lines.append(f'![{IMG_ALT_PREFIX} p{pno+1}]({pil_to_b64(im)})')
-
-            pages_md.append("\n\n".join([l for l in lines if l is not None]).strip())
-
-        return ("\n\n".join(pages_md).strip(), meta)
-
-    finally:
-        doc.close()
+def should_embed_images_for_page(ocr_txt: str, ocr_score: float) -> bool:
+    if EMBED_IMAGES == "all":
+        return True
+    if EMBED_IMAGES == "none":
+        return False
+    # ocr_only
+    if not ocr_txt or len(ocr_txt.strip()) < OCR_MIN_CHARS or ocr_score < OCR_SCORE_GOOD_ENOUGH:
+        return True
+    return False
 
 # ---------------------------
 # Mini interface web
@@ -440,14 +286,14 @@ HTML_PAGE = r'''<!doctype html>
   <title>MarkItDown UI</title>
   <style>
     :root{color-scheme: light dark;}
-    body{font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial; padding:24px; max-width: 980px; margin:auto; line-height:1.45}
+    body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial; padding:24px; max-width: 980px; margin:auto; line-height:1.45}
     h1{margin-bottom:0.5rem}
     .card{border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin-top:16px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
     .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
     label{font-weight:600}
     button{padding:10px 16px;border:1px solid #111;border-radius:10px;background:#111;color:#fff;cursor:pointer}
     button:disabled{opacity:.5;cursor:not-allowed}
-    textarea{width:100%;min-height:260px;padding:12px;border-radius:10px;border:1px solid #e5e7eb;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    textarea{width:100%;min-height:260px;padding:12px;border-radius:10px;border:1px solid #e5e7eb;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace}
     .muted{color:#6b7280;font-size:12px}
     input[type="checkbox"]{transform: scale(1.2);}
     a#download{padding:10px 16px;border:1px solid #111;border-radius:10px;text-decoration:none}
@@ -455,8 +301,8 @@ HTML_PAGE = r'''<!doctype html>
   </style>
 </head>
 <body>
-  <h1>Conversion → Markdown</h1>
-  <p class="muted">PDF : reconstruction par blocs (titres/listes/tables). « Forcer OCR » : texte des images (ou image base64) inséré <em>in-place</em>. Autres formats : MarkItDown.</p>
+  <h1>MarkItDown — Conversion</h1>
+  <p class="muted">Upload un document (PDF, DOCX, PPTX, XLSX, HTML, etc.) → Markdown. Optionnel : résumé Azure OpenAI, OCR avec détection de tableaux, et intégration d’images en base64.</p>
 
   <div class="card">
     <div class="row">
@@ -474,7 +320,7 @@ HTML_PAGE = r'''<!doctype html>
     <div class="row" style="margin-top:8px; gap:8px; align-items:baseline;">
       <label for="di">Endpoint Azure Document Intelligence</label>
       <input id="di" type="text" placeholder="https://<resource>.cognitiveservices.azure.com/"/>
-      <span class="muted">Optionnel (MarkItDown, non utilisé pour PDF)</span>
+      <span class="muted">Optionnel (meilleur OCR/layout pour PDF scannés)</span>
     </div>
     <div class="row" style="margin-top:8px">
       <button id="convert">Convertir</button>
@@ -496,7 +342,10 @@ HTML_PAGE = r'''<!doctype html>
 <script>
 const $ = (id)=>document.getElementById(id);
 const endpoint = "/convert";
-fetch("/config").then(r=>r.ok?r.json():null).then(j=>{ if(j && j.docintel_default){ $("di").value = j.docintel_default; } }).catch(()=>{});
+
+fetch("/config").then(r=>r.ok?r.json():null).then(j=>{
+  if(j && j.docintel_default){ $("di").value = j.docintel_default; }
+}).catch(()=>{});
 
 $("convert").onclick = async () => {
   const f = $("file").files[0];
@@ -520,6 +369,7 @@ $("convert").onclick = async () => {
     const json = await res.json();
     $("md").value = json.markdown || "";
     $("meta").value = JSON.stringify(json.metadata || {}, null, 2);
+
     const blob = new Blob([$("md").value], {type:"text/markdown;charset=utf-8"});
     const url  = URL.createObjectURL(blob);
     const a = $("download");
@@ -552,21 +402,26 @@ def get_config():
 @app.post("/convert")
 async def convert(
     file: UploadFile = File(...),
-    use_plugins: bool = Form(False),          # pour DOCX/PPTX/XLSX/HTML → MarkItDown
+    use_plugins: bool = Form(False),
     docintel_endpoint: Optional[str] = Form(None),
-    llm_model: Optional[str] = Form(None),    # compat
+    llm_model: Optional[str] = Form(None),   # ignoré pour Azure; gardé pour compat
     use_llm: bool = Form(False),
     force_ocr: bool = Form(False),
 ):
     """
-    PDF:
-      - plugins cochés, OCR décoché   → texte seul (titres/listes/tables), pas d'images.
-      - plugins cochés + Forcer OCR   → texte + OCR des images in-place (ou image base64 si OCR faible).
-    Autres formats → MarkItDown.
+    Convertit le fichier avec MarkItDown.
+    Fallback OCR (Tesseract) si le texte est pauvre, ou si force_ocr=true.
+    Peut embarquer des images PDF en base64 selon EMBED_IMAGES.
+    Optionnel: résumé Azure OpenAI (use_llm=true).
     """
     try:
         if not docintel_endpoint:
             docintel_endpoint = DEFAULT_DOCINTEL_ENDPOINT
+
+        md = MarkItDown(
+            enable_plugins=use_plugins,
+            docintel_endpoint=docintel_endpoint
+        )
 
         content = await file.read()
 
@@ -577,48 +432,120 @@ async def convert(
             with open(in_path, "wb") as f:
                 f.write(content)
 
+        # MarkItDown
+        stream = io.BytesIO(content)
+        result = md.convert_stream(stream, file_name=file.filename)
+
+        markdown = getattr(result, "text_content", "") or ""
+        metadata = getattr(result, "metadata", None) or {}
+        warnings = getattr(result, "warnings", None)
+        if warnings:
+            metadata["warnings"] = warnings
+
+        # OCR fallback & images
         is_pdf = guess_is_pdf(file.filename, file.content_type)
         is_img = guess_is_image(file.filename, file.content_type)
 
-        metadata: Dict[str, Any] = {}
-        markdown = ""
+        ocr_scores_per_page: List[float] = []
+        pdf_images_md_per_page: List[str] = []
 
-        if is_pdf:
-            # Case matrix:
-            # - use_plugins True & !force_ocr  => texte seul
-            # - use_plugins True & force_ocr   => texte + images (OCR/BASE64) in-place
-            want_text = True
-            want_inline_images = bool(force_ocr)   # images seulement si OCR coché
-            want_ocr = bool(force_ocr)
-            markdown, meta = build_pdf_markdown(content, want_text, want_inline_images, want_ocr)
-            metadata.update(meta)
+        if OCR_ENABLED and (force_ocr or (len(markdown.strip()) < OCR_MIN_CHARS and (is_pdf or is_img))):
+            if is_pdf:
+                ocr_text, pages_done, ocr_scores_per_page = ocr_pdf_bytes(content, OCR_LANGS, OCR_DPI, OCR_MAX_PAGES)
+                metadata["ocr_pages"] = pages_done
+                metadata["ocr_langs"] = OCR_LANGS
+                metadata["ocr_dpi"] = OCR_DPI
 
-        elif is_img:
-            # Image standalone
-            body = []
-            try:
-                with Image.open(io.BytesIO(content)) as im:
-                    im = resize_max(im, IMG_MAX_WIDTH)
-                    if OCR_ENABLED and force_ocr:
-                        txt, score = ocr_pil_best(im)
-                        if txt.strip() and (score >= OCR_SCORE_GOOD_ENOUGH or len(txt) >= OCR_MIN_CHARS//4):
-                            body.append("# OCR (image)\n" + txt)
-                        else:
-                            if EMBED_IMAGES != "none":
-                                body.append(f'![{IMG_ALT_PREFIX}]({pil_to_b64(im)})')
+                # Embedding d'images PDF par page si demandé
+                if EMBED_IMAGES != "none":
+                    try:
+                        doc = fitz.open(stream=content, filetype="pdf")
+                        for i in range(min(doc.page_count, OCR_MAX_PAGES)):
+                            md_imgs = extract_pdf_images_as_md(doc, i)
+                            pdf_images_md_per_page.append(md_imgs)
+                        doc.close()
+                    except Exception:
+                        pass
+
+                # Assemblage Markdown + images (page par page)
+                if ocr_text.strip():
+                    if OCR_MODE == "append" and markdown.strip():
+                        markdown += "\n\n# OCR (extrait)\n" + ocr_text
                     else:
-                        if EMBED_IMAGES != "none":
-                            body.append(f'![{IMG_ALT_PREFIX}]({pil_to_b64(im)})')
-            except Exception:
-                pass
-            markdown = "\n\n".join(body).strip() or "(image)"
+                        if len(markdown.strip()) < OCR_MIN_CHARS:
+                            markdown = f"# OCR\n{ocr_text}"
+                        else:
+                            markdown += "\n\n# OCR (extrait)\n" + ocr_text
 
-        else:
-            # Tous les autres formats → MarkItDown
-            md = MarkItDown(enable_plugins=use_plugins, docintel_endpoint=docintel_endpoint)
-            res = md.convert_stream(io.BytesIO(content), file_name=file.filename)
-            markdown = (getattr(res, "text_content", "") or "").strip()
-            metadata.update(getattr(res, "metadata", {}) or {})
+                    # Si images à intégrer
+                    if EMBED_IMAGES != "none" and pdf_images_md_per_page:
+                        md_lines = []
+                        pages = ocr_text.split("\n\n## Page ")
+                        # reconstruire en insérant images après chaque page OCR si condition
+                        # pages[0] peut contenir "# OCR" + début, gérer proprement
+                        for idx, chunk in enumerate(pages):
+                            if not chunk.strip():
+                                continue
+                            # rétablir l’entête si nécessaire
+                            if idx == 0 and chunk.startswith("# OCR"):
+                                md_lines.append(chunk.strip())
+                                continue
+                            prefix = "## Page " if idx > 0 else ""
+                            if prefix:
+                                md_lines.append(prefix + chunk.strip())
+                            # insérer images pour cette page si utile
+                            page_num = None
+                            try:
+                                # chunk commence souvent par "N\n\n...", on récupère N
+                                first_line = chunk.splitlines()[0].strip()
+                                page_num = int(first_line.split()[0]) if first_line and first_line[0].isdigit() else None
+                            except Exception:
+                                page_num = None
+                            # fallback : use idx
+                            if page_num is None:
+                                page_num = idx
+                            # decide embed
+                            if 1 <= page_num <= len(ocr_scores_per_page):
+                                score = ocr_scores_per_page[page_num - 1]
+                                imgs_md = pdf_images_md_per_page[page_num - 1] if page_num - 1 < len(pdf_images_md_per_page) else ""
+                                if imgs_md and should_embed_images_for_page(chunk, score):
+                                    md_lines.append("\n\n### Captures\n" + imgs_md)
+                        markdown = "\n\n".join(md_lines) if md_lines else markdown
+
+                else:
+                    metadata["ocr_note"] = "OCR tenté mais aucun texte détecté."
+                    # si on n’a pas de texte mais EMBED_IMAGES=ocr_only|all, on peut tout de même pousser les images
+                    if EMBED_IMAGES != "none" and pdf_images_md_per_page:
+                        blocks = []
+                        for i, md_imgs in enumerate(pdf_images_md_per_page, start=1):
+                            if md_imgs:
+                                blocks.append(f"## Page {i}\n\n### Captures\n{md_imgs}")
+                        if blocks:
+                            markdown += ("\n\n# Images extraites\n" + "\n\n".join(blocks))
+
+            elif is_img:
+                ocr_text, score = ocr_image_bytes(content, OCR_LANGS)
+                if ocr_text.strip():
+                    if OCR_MODE == "append" and markdown.strip():
+                        markdown += "\n\n# OCR (extrait)\n" + ocr_text
+                    else:
+                        if len(markdown.strip()) < OCR_MIN_CHARS:
+                            markdown = ocr_text
+                        else:
+                            markdown += "\n\n# OCR (extrait)\n" + ocr_text
+                else:
+                    metadata["ocr_note"] = "OCR tenté mais aucun texte détecté."
+
+                # image seule : option d’embed si ocr_only ou all
+                if EMBED_IMAGES in ("ocr_only", "all"):
+                    try:
+                        with Image.open(io.BytesIO(content)) as im:
+                            im = _pil_resize_max(im, IMG_MAX_WIDTH)
+                            data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+                            if EMBED_IMAGES == "all" or (EMBED_IMAGES == "ocr_only" and (not ocr_text or score < OCR_SCORE_GOOD_ENOUGH)):
+                                markdown += f'\n\n![{IMG_ALT_PREFIX}]({data_uri})\n'
+                    except Exception:
+                        pass
 
         # Persist output
         out_name = f"{os.path.splitext(file.filename)[0]}.md"
@@ -642,8 +569,18 @@ async def convert(
                         ],
                         max_completion_tokens=800
                     )
-                    msg = resp.choices[0].message if resp and getattr(resp, "choices", None) else None
-                    metadata["azure_summary"] = getattr(msg, "content", None) or "[Résumé vide]"
+                    content_msg = None
+                    if resp and getattr(resp, "choices", None):
+                        msg = resp.choices[0].message
+                        if hasattr(msg, "content") and isinstance(msg.content, str):
+                            content_msg = msg.content
+                        elif hasattr(msg, "content") and isinstance(msg.content, list):
+                            parts = []
+                            for part in msg.content:
+                                if isinstance(part, dict) and "text" in part:
+                                    parts.append(part["text"])
+                            content_msg = "".join(parts) if parts else None
+                    metadata["azure_summary"] = content_msg or "[Résumé vide (vérifie le déploiement et le contenu)]"
                 except Exception as e:
                     metadata["azure_summary"] = f"[Erreur Azure OpenAI: {type(e).__name__}: {e}]"
             else:
