@@ -50,7 +50,7 @@ Il inclut :
 
 ## Prérequis
 
-- Docker / Docker Compose (ou Portainer).
+- Docker / Docker Compose.
 - Accès réseau sortant si usage d’Azure OpenAI (facultatif).
 - Pour l’OCR :
   - Paquets Tesseract & langues : `tesseract-ocr`, `tesseract-ocr-fra`, `tesseract-ocr-eng`.
@@ -71,7 +71,7 @@ Il inclut :
 
 ## Déploiement rapide (Docker Compose)
 
-`docker-compose.yml` (extrait identique à ta stack) :
+`docker-compose.yml` :
 
 ```yaml
 services:
@@ -119,14 +119,6 @@ volumes:
   md_uploads:
   md_output:
 ```
-
-### Avec Portainer
-1. **Stacks** → **Add stack**.  
-2. Colle le `docker-compose.yml` ci-dessus.  
-3. **Deploy the stack**.  
-4. Accède à `http://<host>:5704` pour la mini-UI.
-
----
 
 ## Build & run locaux
 
@@ -289,14 +281,6 @@ Pour économiser : `IMG_FORMAT=jpeg` + `IMG_JPEG_QUALITY=80`.
 
 ---
 
-## Sécurité
-
-- Le service **accepte des fichiers** — place-le derrière un **reverse proxy** (auth, rate-limit, taille max).
-- Évite d’exposer `AZURE_OPENAI_KEY`. Utilise des **secrets** Docker/Portainer si possible.
-- `SAVE_UPLOADS/SAVE_OUTPUTS` : désactive en environnements sensibles, ou purges régulières.
-
----
-
 ## Dépannage
 
 - **Mini-UI : bouton Convertir inactif**  
@@ -321,26 +305,12 @@ Pour économiser : `IMG_FORMAT=jpeg` + `IMG_JPEG_QUALITY=80`.
 
 ## Licence
 
-MIT (proposé) — à adapter selon tes besoins.
+MIT
 
 ---
 
 ## Auteur
 
-- Yohann — DevOps. Contributions bienvenues : PRs, issues, suggestions.
+- Yoslo59. Contributions bienvenues : PRs, issues, suggestions.
 
 ---
-
-## PS (ops)
-
-- Si tu souhaites **basculer d’`image:`** (pré-build) **à `build:`** (depuis Git), remplace dans le compose :
-
-```yaml
-services:
-  markitdown-api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: markitdown-api:local
-    ...
-```
