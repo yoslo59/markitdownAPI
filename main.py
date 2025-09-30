@@ -281,10 +281,36 @@ def _line_to_md(spans: List[Dict[str,Any]], median_size: float) -> str:
         return f"{raw}"
     return raw
 
+def _median_line_height(page_raw: Dict[str, Any]) -> float:
+    heights = []
+    for b in page_raw.get("blocks", []):
+        if b.get("type", 0) != 0:
+            continue
+        for l in b.get("lines", []):
+            ymin = min(s.get("bbox", [0,0,0,0])[1] for s in l.get("spans", []) if s.get("bbox"))
+            ymax = max(s.get("bbox", [0,0,0,0])[3] for s in l.get("spans", []) if s.get("bbox"))
+            if ymax > ymin:
+                heights.append(ymax - ymin)
+    if not heights:
+        return 12.0
+    heights.sort()
+    mid = len(heights)//2
+    return heights[mid] if len(heights)%2==1 else (heights[mid-1]+heights[mid])/2.0
+
+def _band_key(y_center: float, band_h: float) -> int:
+    if band_h <= 0:
+        band_h = 12.0
+    return int(y_center / band_h)
+
 def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
     """
-    Parcourt chaque page et insère texte/images exactement à leur place.
-    Fallback : si la page reste pauvre en texte, OCR pleine page et insertion ici.
+    Parcourt chaque page et insère texte/images exactement à leur place (lecture visuelle).
+    Stratégie :
+      - On crée des 'atoms' (par LIGNE de texte + par IMAGE) avec bbox.
+      - On convertit chaque ligne en MD (gras, titres, listes), chaque image en OCR texte
+        sinon en base64 si OCR insuffisant.
+      - On trie par 'bandes' verticales (y) puis gauche→droite (x) pour gérer multi-colonnes.
+      - Fallback: si page encore pauvre en texte → OCR pleine page INSÉRÉ ICI (pas en fin).
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     md_lines: List[str] = []
@@ -295,36 +321,54 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
             page = doc.load_page(p)
             raw = page.get_text("rawdict") or {}
             median_size = _median_font_size(raw)
-            blocks = raw.get("blocks", [])
-            # tri par position
-            blocks.sort(key=lambda b: (b.get("bbox", [0,0,0,0])[1], b.get("bbox", [0,0,0,0])[0]))
+            line_h_med = _median_line_height(raw)
+            band_h = max(8.0, line_h_med * 1.2)
 
-            page_buf: List[str] = []
-            page_text_chars = 0
+            # 1) Construire les atoms (texte par LIGNE + images)
+            atoms = []  # dicts: {"bbox":(x0,y0,x1,y1), "md":str, "kind":"text"|"image", "text_len":int, "area_ratio":float}
+            page_w = page.rect.width
+            page_h = page.rect.height
+            page_area = max(1.0, page_w * page_h)
 
-            for b in blocks:
+            for b in raw.get("blocks", []):
                 btype = b.get("type", 0)
                 bbox = tuple(b.get("bbox", (0,0,0,0)))
+                x0,y0,x1,y1 = bbox
+                # Sanity: garder dans page
+                x0 = max(0.0, min(x0, page_w)); x1 = max(0.0, min(x1, page_w))
+                y0 = max(0.0, min(y0, page_h)); y1 = max(0.0, min(y1, page_h))
+                bbox = (x0,y0,x1,y1)
+
                 if btype == 0:
-                    # bloc texte
-                    para_buf = []
+                    # Pour le texte, on fabrique un atom PAR LIGNE (meilleure granularité de position)
                     for line in b.get("lines", []):
-                        md_line = _line_to_md(line.get("spans", []), median_size)
-                        if md_line:
-                            para_buf.append(md_line)
-                    if para_buf:
-                        block_txt = "\n".join(para_buf)
-                        page_text_chars += len(block_txt)
-                        if _table_chars.search(block_txt):
-                            page_buf.append("```text")
-                            page_buf.append(block_txt)
-                            page_buf.append("```")
-                        else:
-                            page_buf.append(block_txt)
+                        spans = line.get("spans", [])
+                        # bbox de la ligne (union des spans)
+                        if not spans:
+                            continue
+                        lx0 = min(s.get("bbox", [x0,y0,x1,y1])[0] for s in spans if s.get("bbox"))
+                        ly0 = min(s.get("bbox", [x0,y0,x1,y1])[1] for s in spans if s.get("bbox"))
+                        lx1 = max(s.get("bbox", [x0,y0,x1,y1])[2] for s in spans if s.get("bbox"))
+                        ly1 = max(s.get("bbox", [x0,y0,x1,y1])[3] for s in spans if s.get("bbox"))
+                        line_bbox = (lx0, ly0, lx1, ly1)
+
+                        md_line = _line_to_md(spans, median_size).strip()
+                        if not md_line:
+                            continue
+                        # Emballage ASCII table si besoin sera fait plus tard au blocage; ici, on laisse la ligne brute.
+                        atoms.append({
+                            "bbox": line_bbox,
+                            "md": md_line,
+                            "kind": "text",
+                            "text_len": len(md_line),
+                            "area_ratio": ( (lx1-lx0) * (ly1-ly0) ) / page_area
+                        })
+
                 elif btype == 1:
-                    # bloc image
+                    # IMAGE: OCR localisé, sinon base64
                     im = crop_bbox_image(page, bbox, OCR_DPI)
                     if im is None:
+                        # fallback xref si dispo
                         info = b.get("image")
                         if isinstance(info, dict) and "xref" in info:
                             try:
@@ -338,15 +382,78 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                         continue
                     im = _pil_resize_max(im, IMG_MAX_WIDTH)
                     txt, score = _ocr_image_best(im, OCR_LANGS)
-                    if txt and score >= OCR_SCORE_GOOD_ENOUGH:
-                        page_text_chars += len(txt)
-                        page_buf.append(_wrap_tables_as_code(txt))
-                    else:
-                        if EMBED_IMAGES in ("all","ocr_only"):
-                            data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
-                            page_buf.append(f'![{IMG_ALT_PREFIX} p{p+1}]({data_uri})')
+                    area_ratio = ((x1-x0)*(y1-y0))/page_area
 
-            # Fallback : si toujours trop peu de texte sur la page -> OCR pleine page ici
+                    # Heuristique: ignorer très grandes images "fond" si on aura suffisamment de texte par ailleurs.
+                    is_background_like = area_ratio > 0.85
+
+                    if txt and score >= OCR_SCORE_GOOD_ENOUGH and not is_background_like:
+                        md_img = _wrap_tables_as_code(txt.strip())
+                    else:
+                        # base64 si demandé
+                        md_img = ""
+                        if EMBED_IMAGES in ("all", "ocr_only"):
+                            data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+                            md_img = f'![{IMG_ALT_PREFIX} p{p+1}]({data_uri})'
+
+                    if md_img:
+                        atoms.append({
+                            "bbox": bbox,
+                            "md": md_img,
+                            "kind": "image",
+                            "text_len": len(txt or ""),
+                            "area_ratio": area_ratio
+                        })
+
+            # 2) Tri lecture : bandes verticales (centre Y // band_h) puis X
+            def sort_key(a):
+                x0,y0,x1,y1 = a["bbox"]
+                y_center = 0.5*(y0+y1)
+                return (_band_key(y_center, band_h), x0, y0)
+            atoms.sort(key=sort_key)
+
+            # 3) Concat, avec regroupement ‘paragraphe’ + emballage ASCII tables
+            page_buf: List[str] = []
+            para_buf: List[str] = []
+            last_band = None
+
+            def flush_para():
+                if not para_buf:
+                    return
+                block_txt = "\n".join(para_buf)
+                # si présence nette de tableaux ASCII → encadrer
+                if _table_chars.search(block_txt):
+                    page_buf.append("```text")
+                    page_buf.append(block_txt)
+                    page_buf.append("```")
+                else:
+                    page_buf.append(block_txt)
+                para_buf.clear()
+
+            for a in atoms:
+                x0,y0,x1,y1 = a["bbox"]
+                y_center = 0.5*(y0+y1)
+                band = _band_key(y_center, band_h)
+                md = a["md"]
+
+                # changement de bande = probablement retour à la ligne/bloc
+                if last_band is not None and band != last_band:
+                    flush_para()
+                last_band = band
+
+                if a["kind"] == "text":
+                    # Coller la ligne au paragraphe en conservant le format (titres/listes déjà gérés)
+                    para_buf.append(md)
+                else:
+                    # image/ocr: la poser "inline" → on coupe le paragraphe en cours
+                    flush_para()
+                    page_buf.append(md)
+
+            # vider le dernier paragraphe
+            flush_para()
+
+            # 4) Fallback OCR pleine page si toujours pauvre en texte
+            page_text_chars = sum(len(x) for x in page_buf if x and not x.strip().startswith("!["))  # ne compte pas l'image MD
             if page_text_chars < OCR_MIN_CHARS:
                 try:
                     best_txt, best_score = "", -1e9
@@ -364,11 +471,10 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                     pass
 
             if page_buf:
-                # Option: insérer un titre de page
-                # md_lines.append(f"\n<!-- Page {p+1} -->")
                 md_lines.append("\n\n".join(page_buf))
 
-        return ("\n\n".join([l for l in md_lines if l.strip()]).strip() or "", meta)
+        final_md = "\n\n".join([l for l in md_lines if l.strip()]).strip()
+        return (final_md, meta)
     finally:
         doc.close()
 
