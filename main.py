@@ -26,6 +26,7 @@ try:
 except Exception:
     _HAS_CV2 = False
 
+
 # ---------------------------
 # Config via variables d'env
 # ---------------------------
@@ -40,7 +41,7 @@ AZURE_KEY        = os.getenv("AZURE_OPENAI_KEY", "").strip()
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "o4-mini").strip()
 AZURE_API_VER    = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview").strip()
 
-# OCR (tunable sans rebuild)
+# OCR de base
 OCR_ENABLED        = os.getenv("OCR_ENABLED", "true").lower() == "true"
 OCR_LANGS          = os.getenv("OCR_LANGS", "fra+eng").strip()
 OCR_DPI            = int(os.getenv("OCR_DPI", "350"))
@@ -50,40 +51,42 @@ OCR_MODE           = os.getenv("OCR_MODE", "append").strip()
 OCR_KEEP_SPACES    = os.getenv("OCR_KEEP_SPACES", "true").lower() == "true"
 OCR_TWO_PASS       = os.getenv("OCR_TWO_PASS", "true").lower() == "true"
 OCR_TABLE_MODE     = os.getenv("OCR_TABLE_MODE", "true").lower() == "true"
-OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,3,4,11").split(",")]
+OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,4,3,11").split(",")]
 OCR_DPI_CANDIDATES = [int(x) for x in os.getenv("OCR_DPI_CANDIDATES", "300,350,400").split(",")]
 OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
 
-# Prétraitements OCR avancés
-OCR_DESKEW         = os.getenv("OCR_DESKEW", "true").lower() == "true"
-OCR_BINARIZE       = os.getenv("OCR_BINARIZE", "true").lower() == "true"
-OCR_TEXT_QUALITY_MIN = float(os.getenv("OCR_TEXT_QUALITY_MIN", "0.30"))   # filtre anti-bruit
-OCR_MIN_OCR_WIDTH    = int(os.getenv("OCR_MIN_OCR_WIDTH", "1500"))        # upscale avant OCR
-OCR_AUTO_INVERT      = os.getenv("OCR_AUTO_INVERT", "true").lower() == "true"
+# Prétraitements avancés
+OCR_DESKEW            = os.getenv("OCR_DESKEW", "true").lower() == "true"
+OCR_BINARIZE          = os.getenv("OCR_BINARIZE", "true").lower() == "true"
+OCR_TEXT_QUALITY_MIN  = float(os.getenv("OCR_TEXT_QUALITY_MIN", "0.30"))
+OCR_MIN_OCR_WIDTH     = int(os.getenv("OCR_MIN_OCR_WIDTH", "1500"))
+OCR_AUTO_INVERT       = os.getenv("OCR_AUTO_INVERT", "true").lower() == "true"
 
-# Contrôle agressivité OCR images / fallback
+# Politique OCR images & fallback page
 OCR_DISABLE_PAGE_FALLBACK = os.getenv("OCR_DISABLE_PAGE_FALLBACK", "true").lower() == "true"
-IMAGE_OCR_MODE = os.getenv("IMAGE_OCR_MODE", "conservative").strip()  # conservative|always|never
-IMAGE_OCR_MIN_WORDS = int(os.getenv("IMAGE_OCR_MIN_WORDS", "12"))
+IMAGE_OCR_ON_VECTOR_PAGES = os.getenv("IMAGE_OCR_ON_VECTOR_PAGES", "true").lower() == "true"
+IMAGE_OCR_MODE = os.getenv("IMAGE_OCR_MODE", "smart").strip()  # smart | conservative | always | never
+IMAGE_OCR_MIN_WORDS = int(os.getenv("IMAGE_OCR_MIN_WORDS", "10"))
 
 # Images base64
 EMBED_IMAGES       = os.getenv("EMBED_IMAGES", "ocr_only").strip()  # none | ocr_only | all
-IMG_FORMAT         = os.getenv("IMG_FORMAT", "png").strip().lower()  # png | jpeg
+IMG_FORMAT         = os.getenv("IMG_FORMAT", "jpeg").strip().lower()  # png | jpeg
 IMG_JPEG_QUALITY   = int(os.getenv("IMG_JPEG_QUALITY", "85"))
-IMG_MAX_WIDTH      = int(os.getenv("IMG_MAX_WIDTH", "1400"))
+IMG_MAX_WIDTH      = int(os.getenv("IMG_MAX_WIDTH", "1600"))
 IMG_ALT_PREFIX     = os.getenv("IMG_ALT_PREFIX", "Capture").strip()
 
 # (Optionnel) Azure Document Intelligence
 DEFAULT_DOCINTEL_ENDPOINT = os.getenv("DEFAULT_DOCINTEL_ENDPOINT", "").strip()
 
-# Dossiers persistants
+# Dossiers
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="3.3-conservative-ocr")
+app = FastAPI(title="MarkItDown API", version="3.4-smart-image-ocr")
 
 app.add_middleware(
     CORSMiddleware,
@@ -102,8 +105,9 @@ def get_azure_client() -> Optional[AzureOpenAI]:
         )
     return None
 
+
 # ---------------------------
-# Helpers génériques & markdown
+# Helpers fichiers & markdown
 # ---------------------------
 def guess_is_pdf(filename: str, content_type: Optional[str]) -> bool:
     if content_type and content_type.lower() in ("application/pdf", "pdf"):
@@ -125,7 +129,6 @@ def guess_is_csv(filename: str) -> bool:
     return filename.lower().endswith(".csv")
 
 def _md_cleanup(md: str) -> str:
-    """Post-format léger + nettoyage + filtre de gros blocs ASCII bruyants."""
     if not md:
         return md
     lines = []
@@ -135,21 +138,18 @@ def _md_cleanup(md: str) -> str:
         l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)  # "1)" -> "1. "
         lines.append(l)
     txt = "\n".join(lines)
-    # Encadre blocs ASCII “grilles”
+    # Encadrer grilles ASCII en ```text
     txt = re.sub(
         r"(?:^|\n)((?:[|+\-=_].*\n){2,})",
         lambda m: "```text\n" + m.group(1).strip() + "\n```",
-        txt,
-        flags=re.S
+        txt, flags=re.S
     )
 
-    # Supprime blocs code 'text' manifestement bruités
+    # Supprimer gros blocs bruités
     def _is_noise_block(b: str) -> bool:
-        if not b:
-            return False
+        if not b: return False
         n = len(b)
-        if n < 1200:
-            return False
+        if n < 1200: return False
         alnum = sum(ch.isalnum() for ch in b)
         return (alnum / n) < 0.05
 
@@ -159,14 +159,14 @@ def _md_cleanup(md: str) -> str:
         txt, flags=re.S
     )
 
-    # Pandas markdown leftovers
     txt = txt.replace(" NaN", " ").replace("NaN", " ")
     return txt.strip()
+
 
 # ---------------------------
 # OCR utils
 # ---------------------------
-_table_chars = re.compile(r"[|+\-=_]{3,}")  # heuristique ASCII
+_table_chars = re.compile(r"[|+\-=_]{3,}")
 
 def _tess_config(psm: str, keep_spaces: bool, table_mode: bool) -> str:
     cfg = f"--psm {psm} --oem 1"
@@ -179,34 +179,22 @@ def _tess_config(psm: str, keep_spaces: bool, table_mode: bool) -> str:
 def _opencv_preprocess_for_ocr(im: Image.Image) -> Image.Image:
     if not _HAS_CV2:
         return im
-    # PIL -> OpenCV (grayscale)
     cv = cv2.cvtColor(np.array(im.convert("RGB")), cv2.COLOR_RGB2GRAY)
-
-    # Binarize adaptative
     if OCR_BINARIZE:
-        cv = cv2.adaptiveThreshold(
-            cv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 35, 11
-        )
-
-    # Deskew
+        cv = cv2.adaptiveThreshold(cv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 35, 11)
     if OCR_DESKEW:
-        coords = cv2.findNonZero(255 - cv)  # texte = noir
+        coords = cv2.findNonZero(255 - cv)
         if coords is not None:
             rect = cv2.minAreaRect(coords)
             angle = rect[-1]
-            if angle < -45:
-                angle = -(90 + angle)
-            else:
-                angle = -angle
+            angle = -(90 + angle) if angle < -45 else -angle
             (h, w) = cv.shape[:2]
             M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
             cv = cv2.warpAffine(cv, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
     return Image.fromarray(cv)
 
 def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
-    # Pipeline léger PIL (fallback)
     g = ImageOps.grayscale(im)
     g = ImageOps.autocontrast(g, cutoff=1)
     g = g.filter(ImageFilter.MedianFilter(size=3))
@@ -214,18 +202,16 @@ def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
     return g
 
 def _maybe_invert_dark(im: Image.Image) -> Image.Image:
-    """Inverse si fond global sombre -> Tesseract préfère fond clair / texte sombre."""
     if not OCR_AUTO_INVERT:
         return im
     g = ImageOps.grayscale(im)
     hist = g.histogram()
     mean = sum(hist[i]*i for i in range(256)) / max(1, sum(hist))
-    if mean < 115:  # seuil empirique
+    if mean < 115:
         return ImageOps.invert(im.convert("RGB"))
     return im
 
 def _upscale_min_width(im: Image.Image, min_w: int) -> Image.Image:
-    """Upscale (LANCZOS) si l’image est trop petite pour un OCR lisible."""
     if im.width >= min_w:
         return im
     ratio = min_w / float(im.width)
@@ -264,13 +250,6 @@ def _wrap_tables_as_code(txt: str) -> str:
 _alnum = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 
 def _ocr_quality_score(txt: str) -> float:
-    """
-    Score 'lisibilité' 0–1.
-    - ratio alphanumérique,
-    - longueur utile,
-    - pénalités pour séquences de symboles,
-    - bonus si on voit des mots de 3–12 chars.
-    """
     if not txt:
         return 0.0
     t = txt.replace("\n", " ").strip()
@@ -289,30 +268,54 @@ def _ocr_quality_score(txt: str) -> float:
 def _count_plausible_words(txt: str) -> int:
     return len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{3,}", txt or ""))
 
+def _fast_has_text(im: Image.Image, langs: str, min_words: int) -> bool:
+    """Détection rapide de mots plausibles sur une image (évite OCR complet si inutile)."""
+    try:
+        cfg = "--psm 11 --oem 1"
+        data = pytesseract.image_to_data(im, lang=langs, config=cfg, output_type=pytesseract.Output.DICT)
+        words = [w for w in (data.get("text") or []) if w and re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{2,}", w)]
+        return len(words) >= min_words
+    except Exception:
+        return False
+
+def _classify_ocr_block(txt: str) -> str:
+    """Choisit le rendu Markdown adapté au contenu OCR."""
+    t = (txt or "").strip()
+    if not t:
+        return ""
+
+    # Table ASCII ?
+    if re.search(r"^\s*[+].*[-+].*[+]\s*$", t, flags=re.M) or re.search(r"^\s*\|.*\|\s*$", t, flags=re.M):
+        return f"```text\n{t}\n```"
+
+    # Console / commandes / SQL
+    if re.search(r"^\s*(\$|#)\s", t, flags=re.M) or "mysql>" in t or re.search(r"\bSHOW\s+\w+", t, flags=re.I):
+        if re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|SHOW|GRANT|CHANGE\s+MASTER|START\s+SLAVE|START\s+REPLICA)\b", t, flags=re.I):
+            return f"```sql\n{t}\n```"
+        return f"```bash\n{t}\n```"
+
+    # Logs
+    if re.search(r"\b(Err|ERROR|WARN|INFO)\b", t):
+        return f"```text\n{t}\n```"
+
+    return t
+
 def _ocr_image_best(im: Image.Image, langs: str) -> Tuple[str, float]:
-    # 1) Préparations
     if im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
-
-    # Upscale pour atteindre une largeur “lisible”
     try:
         im_pre = _upscale_min_width(im, OCR_MIN_OCR_WIDTH)
     except Exception:
         im_pre = im
-
-    # Inversion si fond sombre
     try:
         im_pre = _maybe_invert_dark(im_pre)
     except Exception:
         pass
-
-    # OpenCV/PIL preprocessing
     try:
         im2 = _opencv_preprocess_for_ocr(im_pre) if _HAS_CV2 else _preprocess_for_ocr(im_pre)
     except Exception:
         im2 = _preprocess_for_ocr(im_pre)
 
-    # 2) Multi-PSM
     best_txt, best_score = "", -1e9
     for psm in OCR_PSMS:
         cfg = _tess_config(psm, OCR_KEEP_SPACES, OCR_TABLE_MODE)
@@ -332,11 +335,9 @@ def _ocr_image_best(im: Image.Image, langs: str) -> Tuple[str, float]:
         if best_score >= OCR_SCORE_GOOD_ENOUGH:
             break
 
-    # 3) Quality gate final (filtre anti-bruit)
     q = _ocr_quality_score(best_txt)
     if q < OCR_TEXT_QUALITY_MIN:
-        return "", q  # on préfère ne rien insérer
-
+        return "", q
     return best_txt.strip(), q
 
 def ocr_image_bytes(img_bytes: bytes, langs: str) -> Tuple[str, float]:
@@ -349,6 +350,7 @@ def _raster_pdf_page(page: fitz.Page, dpi: int) -> Image.Image:
     mat = fitz.Matrix(scale, scale)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
 
 # ---------------------------
 # Images utilitaires
@@ -382,15 +384,14 @@ def crop_bbox_image(page: fitz.Page, bbox: Tuple[float,float,float,float], dpi: 
     except Exception:
         return None
 
-# ---------------------------
-# PDF inline : texte + images + OCR + hiérarchie & listes
-# ---------------------------
 
+# ---------------------------
+# PDF → Markdown (texte + images OCR smart)
+# ---------------------------
 def _is_bold(flags: int) -> bool:
     return bool(flags & 1 or flags & 32)
 
 def _classify_heading(size: float, size_levels: List[float]) -> Optional[str]:
-    """Map taille → #, ##, ### selon les plus grandes tailles rencontrées."""
     if not size_levels:
         return None
     for idx, s in enumerate(size_levels[:6], start=1):
@@ -417,61 +418,34 @@ def _median_line_height(page_raw: Dict[str, Any]) -> float:
     mid = len(heights)//2
     return heights[mid] if len(heights)%2==1 else (heights[mid-1]+heights[mid])/2.0
 
-def _band_key(y_center: float, band_h: float) -> int:
-    if band_h <= 0:
-        band_h = 12.0
-    return int(y_center / band_h)
-
 def _merge_wrapped_paragraphs(lines: List[str]) -> List[str]:
-    """
-    Fusionne les lignes en paragraphes lisibles.
-    - césure (finissant par '-') + minuscule suivante => colle sans espace
-    - pas de ponctuation forte + minuscule suivante => colle avec espace
-    - ligne vide => flush
-    """
-    out = []
-    buf = ""
-
+    out, buf = [], ""
     def flush():
         nonlocal buf
         if buf.strip():
             out.append(buf.strip())
         buf = ""
-
     for raw in lines:
         s = raw.rstrip()
         if not s:
-            flush()
-            continue
-
+            flush(); continue
         if not buf:
-            buf = s
-            continue
-
-        # césure (recolle le mot)
+            buf = s; continue
         if buf.endswith("-") and s[:1].islower():
-            buf = buf[:-1] + s.lstrip()
-            continue
-
-        # continuation de phrase
+            buf = buf[:-1] + s.lstrip(); continue
         if (not re.search(r"[.!?;:]$", buf)) and (s[:1].islower()):
             buf += " " + s.lstrip()
         else:
-            flush()
-            buf = s
-
+            flush(); buf = s
     flush()
     return out
 
 def _ascii_table_to_md(block: str) -> Optional[str]:
-    """
-    Convertit un tableau ASCII (+---+ ... | ... |) en tableau Markdown via pandas.
-    """
     lines = [l for l in block.splitlines() if l.strip()]
     border_lines = [i for i, l in enumerate(lines) if _table_border_re.match(l)]
     if len(border_lines) < 2:
         return None
-    content = [l for l in lines if l.strip().startsWith("|") and l.strip().endswith("|")] if hasattr(str, "startsWith") else [l for l in lines if l.strip().startswith("|") and l.strip().endswith("|")]
+    content = [l for l in lines if l.strip().startswith("|") and l.strip().endswith("|")]
     if not content:
         return None
     rows = []
@@ -505,37 +479,23 @@ def _collect_sizes(doc: fitz.Document, sample_pages: int = 5) -> List[float]:
     return sizes[:6]
 
 def _line_to_md(spans: List[Dict[str,Any]], size_levels: List[float]) -> str:
-    parts = []
-    max_size = 0.0
+    parts, max_size = [], 0.0
     for sp in spans:
         t = sp.get("text","")
-        if not t:
-            continue
-        size = float(sp.get("size", 0))
-        max_size = max(max_size, size)
-        if _is_bold(int(sp.get("flags",0))):
-            parts.append(f"**{t}**")
-        else:
-            parts.append(t)
+        if not t: continue
+        size = float(sp.get("size", 0)); max_size = max(max_size, size)
+        parts.append(f"**{t}**" if _is_bold(int(sp.get("flags",0))) else t)
     raw = "".join(parts).strip()
-    if not raw:
-        return ""
-    if _bullet_re.match(raw):
-        return raw
+    if not raw: return ""
+    if _bullet_re.match(raw): return raw
     h = _classify_heading(max_size, size_levels)
-    if h and len(raw) < 180:
-        return f"{h} {raw}"
+    if h and len(raw) < 180: return f"{h} {raw}"
     return raw
 
 def _guess_columns(atoms: List[Dict[str,Any]], max_cols: int = 3) -> List[Tuple[float,float]]:
-    """
-    Devine 1–3 colonnes par clustering naïf des x-centres.
-    Retourne des intervalles (x_min, x_max) triés.
-    """
     xs = []
     for a in atoms:
-        if a["kind"] != "text":
-            continue
+        if a["kind"] != "text": continue
         x0,y0,x1,y1 = a["bbox"]
         xs.append(0.5*(x0+x1))
     if len(xs) < 12:
@@ -546,20 +506,17 @@ def _guess_columns(atoms: List[Dict[str,Any]], max_cols: int = 3) -> List[Tuple[
         gaps.append((xs_sorted[i] - xs_sorted[i-1], i))
     gaps.sort(reverse=True)
     cuts = sorted([idx for _, idx in gaps[:max_cols-1]])
-    bands = []
-    start = 0
+    bands, start = [], 0
     for c in cuts:
         seg = xs_sorted[start:c]
-        if seg:
-            bands.append( (min(seg), max(seg)) )
+        if seg: bands.append((min(seg), max(seg)))
         start = c
     seg = xs_sorted[start:]
-    if seg:
-        bands.append( (min(seg), max(seg)) )
+    if seg: bands.append((min(seg), max(seg)))
     pads = []
     for (a,b) in bands:
         width = max(10.0, 0.05*(b-a))
-        pads.append( (a-width, b+width) )
+        pads.append((a-width, b+width))
     return sorted(pads, key=lambda t: t[0])
 
 def _col_index(x_center: float, cols: List[Tuple[float,float]]) -> int:
@@ -570,16 +527,6 @@ def _col_index(x_center: float, cols: List[Tuple[float,float]]) -> int:
     return int(d.index(min(d)))
 
 def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
-    """
-    PDF → Markdown lisible :
-      - Titres (#, ##, ###) via tailles de police
-      - Listes
-      - Paragraphes fusionnés
-      - Tables ASCII → tables Markdown
-      - Images OCR (quality-gate) + embed redimensionné si besoin
-      - Fallback OCR pleine page restreint aux pages sans texte vectoriel
-      - Tri lecture multi-colonnes robuste
-    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     md_lines: List[str] = []
     meta: Dict[str,Any] = {"engine": "pymupdf_inline", "pages": doc.page_count}
@@ -598,6 +545,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
             page_h = page.rect.height
             page_area = max(1.0, page_w * page_h)
 
+            # 1) Collecte texte + images
             for b in raw.get("blocks", []):
                 btype = b.get("type", 0)
                 bbox = tuple(b.get("bbox", (0,0,0,0)))
@@ -610,8 +558,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                     # Lignes de texte
                     for line in b.get("lines", []):
                         spans = line.get("spans", [])
-                        if not spans:
-                            continue
+                        if not spans: continue
                         lx0 = min(s.get("bbox", [x0,y0,x1,y1])[0] for s in spans if s.get("bbox"))
                         ly0 = min(s.get("bbox", [x0,y0,x1,y1])[1] for s in spans if s.get("bbox"))
                         lx1 = max(s.get("bbox", [x0,y0,x1,y1])[2] for s in spans if s.get("bbox"))
@@ -619,95 +566,121 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                         line_bbox = (lx0, ly0, lx1, ly1)
 
                         md_line = _line_to_md(spans, size_levels).strip()
-                        if not md_line:
-                            continue
+                        if not md_line: continue
                         atoms.append({
-                            "bbox": line_bbox,
-                            "md": md_line,
-                            "kind": "text",
+                            "bbox": line_bbox, "md": md_line, "kind": "text",
                             "text_len": len(md_line),
                             "area_ratio": ((lx1-lx0)*(ly1-ly0)) / page_area
                         })
 
                 elif btype == 1:
-                    # IMAGE — OCR sur pleine résolution, embed redimensionné (quality-gate)
-                    im_full = crop_bbox_image(page, bbox, OCR_DPI)
-                    if im_full is None:
-                        info = b.get("image")
-                        if isinstance(info, dict) and "xref" in info:
-                            try:
-                                pix = fitz.Pixmap(doc, info["xref"])
-                                if pix.n >= 4:
-                                    pix = fitz.Pixmap(fitz.csRGB, pix)
-                                im_full = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                            except Exception:
-                                im_full = None
-                    if im_full is None:
-                        continue
+                    # Images : on stocke le bbox, on traitera l'OCR après décision de politique
+                    atoms.append({
+                        "bbox": bbox, "md": None, "kind": "image_raw",
+                        "text_len": 0, "area_ratio": ((x1-x0)*(y1-y0))/page_area
+                    })
 
-                    area_ratio = ((x1-x0)*(y1-y0))/page_area
-                    is_background_like = area_ratio > 0.85
+            # Détection texte vectoriel
+            has_vector_text = any(a["kind"] == "text" for a in atoms)
 
-                    md_img = ""
-                    txt, q = "", 0.0
+            # Politique locale
+            page_image_ocr_mode = IMAGE_OCR_MODE
+            page_disable_fallback = OCR_DISABLE_PAGE_FALLBACK
 
-                    # Politique OCR image
-                    do_img_ocr = (IMAGE_OCR_MODE == "always") or \
-                                 (IMAGE_OCR_MODE == "conservative" and not is_background_like)
+            # Si page avec texte vectoriel : on autorise l'OCR d'image seulement si param activé
+            if has_vector_text and not IMAGE_OCR_ON_VECTOR_PAGES:
+                if page_image_ocr_mode in ("smart", "conservative"):
+                    page_image_ocr_mode = "never"
+            # Jamais de fallback OCR pleine page si texte vectoriel
+            if has_vector_text:
+                page_disable_fallback = True
 
-                    if do_img_ocr:
-                        txt, q = _ocr_image_best(im_full, OCR_LANGS)
+            # 2) Traiter les "image_raw": décider OCR vs embed
+            processed_atoms = []
+            for a in atoms:
+                if a["kind"] != "image_raw":
+                    processed_atoms.append(a); continue
 
-                    # Filtre dur: qualité ET nombre de mots
-                    if txt and q >= OCR_TEXT_QUALITY_MIN and _count_plausible_words(txt) >= IMAGE_OCR_MIN_WORDS:
-                        md_img = _wrap_tables_as_code(txt.strip())
-                    else:
-                        if EMBED_IMAGES in ("all", "ocr_only"):
-                            im_embed = _pil_resize_max(im_full, IMG_MAX_WIDTH)
-                            data_uri = _pil_to_base64(im_embed, IMG_FORMAT, IMG_JPEG_QUALITY)
-                            md_img = f'![{IMG_ALT_PREFIX} – page {p+1}]({data_uri})'
+                x0,y0,x1,y1 = a["bbox"]
+                im_full = crop_bbox_image(page, a["bbox"], OCR_DPI)
+                if im_full is None:
+                    # fallback par xref
+                    try:
+                        img_info = next((blk.get("image") for blk in raw.get("blocks", []) if blk.get("type",0)==1 and tuple(blk.get("bbox",(0,0,0,0)))==a["bbox"]), None)
+                        if isinstance(img_info, dict) and "xref" in img_info:
+                            pix = fitz.Pixmap(doc, img_info["xref"])
+                            if pix.n >= 4: pix = fitz.Pixmap(fitz.csRGB, pix)
+                            im_full = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    except Exception:
+                        im_full = None
+                if im_full is None:
+                    continue
 
-                    if md_img:
-                        atoms.append({
-                            "bbox": bbox,
-                            "md": md_img,
-                            "kind": "image",
-                            "text_len": len(txt or ""),
-                            "area_ratio": area_ratio
-                        })
+                area_ratio = a["area_ratio"]
+                is_background_like = area_ratio > 0.85
 
-            # Tri multi-colonnes
+                # Décision OCR image
+                do_img_ocr = False
+                if page_image_ocr_mode == "always":
+                    do_img_ocr = not is_background_like
+                elif page_image_ocr_mode == "smart":
+                    do_img_ocr = (not is_background_like) and _fast_has_text(im_full, OCR_LANGS, IMAGE_OCR_MIN_WORDS)
+                elif page_image_ocr_mode == "conservative":
+                    do_img_ocr = (not is_background_like)
+                # "never" => False par défaut
+
+                md_img = ""
+                txt, q = "", 0.0
+                if do_img_ocr:
+                    txt, q = _ocr_image_best(im_full, OCR_LANGS)
+
+                # Quality-gate
+                if txt and q >= OCR_TEXT_QUALITY_MIN and _count_plausible_words(txt) >= IMAGE_OCR_MIN_WORDS:
+                    md_img = _classify_ocr_block(txt.strip())
+                else:
+                    if EMBED_IMAGES in ("all", "ocr_only"):
+                        im_embed = _pil_resize_max(im_full, IMG_MAX_WIDTH)
+                        data_uri = _pil_to_base64(im_embed, IMG_FORMAT, IMG_JPEG_QUALITY)
+                        md_img = f'![{IMG_ALT_PREFIX} – page {p+1}]({data_uri})'
+
+                if md_img:
+                    processed_atoms.append({
+                        "bbox": a["bbox"], "md": md_img, "kind": "image",
+                        "text_len": len(txt or ""), "area_ratio": area_ratio
+                    })
+
+            atoms = processed_atoms
+
+            # 3) Tri lecture (multi-colonnes)
             cols = _guess_columns(atoms, max_cols=3)
             def sort_key(a):
                 x0,y0,x1,y1 = a["bbox"]
                 y_center = 0.5*(y0+y1)
                 x_center = 0.5*(x0+x1)
                 col = _col_index(x_center, cols)
-                return (col, _band_key(y_center, band_h), x0, y0)
+                return (col, int(y_center / max(8.0, band_h)), x0, y0)
             atoms.sort(key=sort_key)
 
-            # Concat + fusion paragraphe + tables ASCII → Markdown
+            # 4) Concat & fusion
             page_buf: List[str] = []
             para_buf: List[str] = []
             last_band = None
 
             def flush_para():
-                if not para_buf:
-                    return
+                if not para_buf: return
                 merged = _merge_wrapped_paragraphs(para_buf)
                 for block in merged:
                     if _table_chars.search(block) and ("|" in block or "+" in block):
                         md_tbl = _ascii_table_to_md(block)
                         if md_tbl:
-                            page_buf.append(md_tbl)
-                            continue
+                            page_buf.append(md_tbl); continue
                     page_buf.append(block)
                 para_buf.clear()
 
             for a in atoms:
                 x0,y0,x1,y1 = a["bbox"]
                 y_center = 0.5*(y0+y1)
-                band = _band_key(y_center, band_h)
+                band = int(y_center / max(8.0, band_h))
                 md = a["md"]
 
                 if last_band is not None and band != last_band:
@@ -722,9 +695,8 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
 
             flush_para()
 
-            # Fallback OCR pleine page ?
-            has_vector_text = any(a["kind"] == "text" for a in atoms)
-            if not has_vector_text and not OCR_DISABLE_PAGE_FALLBACK:
+            # 5) Fallback OCR pleine page (UNIQUEMENT si page sans texte vectoriel ET autorisé)
+            if not has_vector_text and not page_disable_fallback:
                 try:
                     best_txt, best_score = "", -1e9
                     for d in OCR_DPI_CANDIDATES:
@@ -750,8 +722,9 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
     finally:
         doc.close()
 
+
 # ---------------------------
-# DOCX / XLSX / CSV — conversions dédiées (propres)
+# DOCX / XLSX / CSV — conversions propres
 # ---------------------------
 def docx_to_md_bytes(data: bytes) -> str:
     md = MarkItDown(enable_plugins=True).convert_stream(io.BytesIO(data), file_name="file.docx")
@@ -780,6 +753,7 @@ def csv_to_md_bytes(data: bytes) -> str:
     tbl = df.to_markdown(index=False, tablefmt="github")
     return _md_cleanup(tbl)
 
+
 # ---------------------------
 # Mini interface (dark)
 # ---------------------------
@@ -791,108 +765,72 @@ HTML_PAGE = r'''<!doctype html>
   <title>MarkItDown UI</title>
   <style>
     :root{
-      color-scheme: dark;
-      --bg: #0b0f14; --bg2: #0e141b; --card: rgba(255,255,255,0.06);
-      --card-border: rgba(255,255,255,0.08); --text: #e6edf3; --muted: #9fb0bf;
-      --accent: #63b3ff; --accent-2: #8f7aff; --ok: #58d68d; --err: #ff6b6b;
-      --shadow: 0 6px 24px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.03);
+      color-scheme: dark; --bg:#0b0f14; --bg2:#0e141b; --card:rgba(255,255,255,0.06);
+      --card-border:rgba(255,255,255,0.08); --text:#e6edf3; --muted:#9fb0bf;
+      --accent:#63b3ff; --accent-2:#8f7aff; --shadow:0 6px 24px rgba(0,0,0,.35);
       --radius: 16px;
     }
     *{box-sizing:border-box}
-    html,body{height:100%}
-    body{
-      margin:0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica Neue,Arial;
-      color:var(--text);
-      background:
-        radial-gradient(1000px 600px at 20% -10%, #183a58 0%, transparent 60%),
-        radial-gradient(900px 500px at 120% 10%, #3b2d6a 0%, transparent 55%),
-        linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
-      background-attachment: fixed; line-height:1.55; padding:32px 20px 40px;
-    }
-    h1{margin:0 0 .35rem 0; font-size:1.65rem; letter-spacing:.2px}
-    .sub{color:var(--muted); font-size:.95rem; margin-bottom:18px}
+    body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica Neue,Arial;color:var(--text);
+      background:radial-gradient(1000px 600px at 20% -10%, #183a58 0%, transparent 60%),
+                 radial-gradient(900px 500px at 120% 10%, #3b2d6a 0%, transparent 55%),
+                 linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%); background-attachment:fixed; line-height:1.55; padding:32px 20px 40px;}
+    h1{margin:0 0 .35rem 0; font-size:1.65rem}
     .container{max-width:1060px; margin:0 auto}
     .card{background:var(--card); border:1px solid var(--card-border); border-radius:var(--radius); box-shadow:var(--shadow); padding:18px; margin-top:16px; backdrop-filter: blur(8px);}
     .row{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
-    label{font-weight:600}
-    input[type="text"], input[type="file"], textarea{background:rgba(255,255,255,0.03); color:var(--text); border:1px solid rgba(255,255,255,0.12); border-radius:12px; padding:10px 12px; outline:none; transition:border .15s, box-shadow .15s}
-    input[type="text"]:focus, textarea:focus{border-color:var(--accent); box-shadow:0 0 0 3px rgba(99,179,255,.15)}
-    textarea{width:100%; min-height:280px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size:.95rem; resize: vertical;}
-    button{padding:10px 16px; border-radius:12px; border:1px solid rgba(255,255,255,0.12); color:#0b0f14;
-      background: linear-gradient(135deg, var(--accent), var(--accent-2)); cursor:pointer; font-weight:700; letter-spacing:.2px; transition:transform .06s, filter .15s, opacity .2s}
-    button:hover{ filter:brightness(1.08) } button:active{ transform:translateY(1px) } button:disabled{ opacity:.55; cursor:not-allowed; filter:none }
-    .btn-ghost{ background:transparent; color:var(--text); border-color:rgba(255,255,255,0.16) }
-    a#download{ display:inline-flex; align-items:center; gap:8px; padding:10px 16px; border-radius:12px; border:1px solid rgba(255,255,255,0.16); text-decoration:none; color:var(--text); background:rgba(255,255,255,0.03); transition:background .15s, border-color .15s }
-    a#download:hover{ background:rgba(255,255,255,0.06); border-color:rgba(255,255,255,0.28) }
+    input[type="text"], input[type="file"], textarea{background:rgba(255,255,255,0.03); color:var(--text); border:1px solid rgba(255,255,255,0.12); border-radius:12px; padding:10px 12px;}
+    textarea{width:100%; min-height:280px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size:.95rem; resize:vertical}
+    button{padding:10px 16px; border-radius:12px; border:1px solid rgba(255,255,255,0.12); color:#0b0f14; background:linear-gradient(135deg, var(--accent), var(--accent-2)); font-weight:700; cursor:pointer}
+    .btn-ghost{background:transparent; color:var(--text); border-color:rgba(255,255,255,0.16)}
+    a#download{display:inline-flex; align-items:center; gap:8px; padding:10px 16px; border-radius:12px; border:1px solid rgba(255,255,255,0.16); color:var(--text); text-decoration:none; background:rgba(255,255,255,0.03)}
     .muted{color:var(--muted)}
-    .drop{ border:1.5px dashed rgba(255,255,255,0.18); border-radius:14px; padding:18px; text-align:center; cursor:pointer; transition:.15s border-color, background .15s; background:rgba(255,255,255,0.02) }
-    .drop:hover{border-color:rgba(255,255,255,0.35)} .drop.active{border-color:var(--accent); background:rgba(99,179,255,.06)}
-    .filemeta{font-size:.95rem; color:var(--text); opacity:.9}
-    .switch{position:relative; display:inline-block; width:44px; height:24px}
-    .switch input{opacity:0; width:0; height:0}
-    .slider{position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background:rgba(255,255,255,0.12); transition:.2s; border-radius:999px; border:1px solid rgba(255,255,255,0.2)}
-    .slider:before{position:absolute; content:""; height:18px; width:18px; left:2px; top:2.5px; background:white; transition:.2s; border-radius:50%}
-    .switch input:checked + .slider{background:linear-gradient(135deg, var(--accent), var(--accent-2)); border-color:transparent}
-    .switch input:checked + .slider:before{ transform:translateX(20px) }
+    .drop{ border:1.5px dashed rgba(255,255,255,0.18); border-radius:14px; padding:18px; text-align:center; cursor:pointer; background:rgba(255,255,255,0.02) }
+    .drop:hover{border-color:rgba(255,255,255,0.35)}
     .progress{height:10px; background:rgba(255,255,255,0.08); border-radius:999px; overflow:hidden; display:none; margin-top:10px}
     .bar{height:100%; width:40%; background:linear-gradient(135deg, var(--accent), var(--accent-2)); border-radius:999px; animation:slide 1.2s infinite}
     @keyframes slide{0%{transform:translateX(-100%)}50%{transform:translateX(50%)}100%{transform:translateX(150%)}}
     .stats{display:flex; gap:12px; align-items:center; margin-top:10px; flex-wrap:wrap}
     .tag{display:inline-flex; gap:6px; align-items:center; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); border-radius:999px; padding:6px 10px; font-size:.9rem}
-    .tag b{font-weight:800}
-    .hero{ background: linear-gradient(135deg, rgba(99,179,255,.14), rgba(143,122,255,.18));
-      border:1px solid rgba(255,255,255,0.12); border-radius: 18px; padding: 16px 18px; box-shadow: var(--shadow); margin-bottom: 18px; }
   </style>
 </head>
 <body>
   <div class="container">
-    <div class="hero">
+    <div style="background:linear-gradient(135deg, rgba(99,179,255,.14), rgba(143,122,255,.18)); border:1px solid rgba(255,255,255,0.12); border-radius:18px; padding:16px 18px; box-shadow:var(--shadow); margin-bottom:18px">
       <h1>MarkItDown — Conversion</h1>
-      <div class="sub">PDF/Images → Markdown hiérarchisé (+ OCR conservateur). DOCX/XLSX/CSV → Markdown propre (tables). Résumé Azure en option.</div>
+      <div class="muted">PDF texte + captures → Markdown propre. OCR sélectif sur images, pas de fallback pleine page.</div>
     </div>
 
     <div class="card">
       <div class="row">
         <label for="file">Fichier :</label>
         <input id="file" type="file" />
-        <div class="filemeta" id="filemeta"></div>
+        <div class="muted" id="filemeta"></div>
       </div>
 
-      <div class="drop" id="dropzone" tabindex="0" aria-label="Déposez un fichier ici">
-        Glissez-déposez votre fichier ici (ou utilisez le champ ci-dessus)
-      </div>
+      <div class="drop" id="dropzone" tabindex="0" aria-label="Déposez un fichier ici">Glissez-déposez votre fichier ici (ou utilisez le champ ci-dessus)</div>
 
       <div class="row" style="margin-top:12px">
         <label for="plugins">Activer plugins MarkItDown</label>
-        <label class="switch">
-          <input id="plugins" type="checkbox" />
-          <span class="slider"></span>
-        </label>
+        <input id="plugins" type="checkbox"/>
 
         <label for="llm">Résumé Azure LLM</label>
-        <label class="switch">
-          <input id="llm" type="checkbox" />
-          <span class="slider"></span>
-        </label>
+        <input id="llm" type="checkbox"/>
 
         <label for="forceocr">Forcer OCR</label>
-        <label class="switch">
-          <input id="forceocr" type="checkbox" />
-          <span class="slider"></span>
-        </label>
+        <input id="forceocr" type="checkbox"/>
       </div>
 
-      <div class="row" style="margin-top:12px; gap:8px; align-items:baseline;">
-        <label for="di">Endpoint Azure Document Intelligence</label>
+      <div class="row" style="margin-top:12px">
+        <label for="di">Endpoint Azure Document Intelligence (optionnel)</label>
         <input id="di" type="text" placeholder="https://<resource>.cognitiveservices.azure.com/"/>
-        <span class="muted">Optionnel (MarkItDown)</span>
       </div>
 
       <div class="row" style="margin-top:12px; gap:10px">
         <button id="convert">Convertir</button>
         <a id="download" download="sortie.md" style="display:none">Télécharger Markdown</a>
-        <button id="copy" class="btn-ghost" title="Copier le Markdown">Copier</button>
-        <button id="clear" class="btn-ghost" title="Vider les zones">Vider</button>
+        <button id="copy" class="btn-ghost">Copier</button>
+        <button id="clear" class="btn-ghost">Vider</button>
       </div>
 
       <div class="stats">
@@ -909,7 +847,6 @@ HTML_PAGE = r'''<!doctype html>
       <label>Markdown</label>
       <textarea id="md" spellcheck="false"></textarea>
     </div>
-
     <div class="card">
       <label>Métadonnées (JSON)</label>
       <textarea id="meta" style="min-height:160px" spellcheck="false"></textarea>
@@ -924,91 +861,35 @@ fetch("/config").then(r=>r.ok?r.json():null).then(j=>{
   if(j && j.docintel_default){ $("di").value = j.docintel_default; }
 }).catch(()=>{});
 
-// Drag & drop
 (function(){
-  const dz = $("dropzone");
-  const fi = $("file");
-  const fm = $("filemeta");
-  function prettySize(bytes){
-    if(bytes < 1024) return bytes + " B";
-    if(bytes < 1024*1024) return (bytes/1024).toFixed(1) + " KB";
-    return (bytes/1024/1024).toFixed(1) + " MB";
-  }
-  function showMeta(f){
-    if(!f){ fm.textContent = ""; return; }
-    fm.textContent = `${f.name} — ${prettySize(f.size)}`;
-  }
+  const dz = $("dropzone"), fi = $("file"), fm = $("filemeta");
+  function prettySize(bytes){ if(bytes<1024) return bytes+" B"; if(bytes<1048576) return (bytes/1024).toFixed(1)+" KB"; return (bytes/1048576).toFixed(1)+" MB"; }
+  function showMeta(f){ fm.textContent = f ? `${f.name} — ${prettySize(f.size)}` : ""; }
   dz.addEventListener("click", ()=> fi.click());
-  dz.addEventListener("dragover", e=>{ e.preventDefault(); dz.classList.add("active"); });
-  dz.addEventListener("dragleave", ()=> dz.classList.remove("active"));
-  dz.addEventListener("drop", e=>{
-    e.preventDefault(); dz.classList.remove("active");
-    if(e.dataTransfer.files && e.dataTransfer.files[0]){
-      fi.files = e.dataTransfer.files;
-      showMeta(fi.files[0]);
-    }
-  });
+  dz.addEventListener("dragover", e=>{ e.preventDefault(); dz.style.borderColor="rgba(99,179,255,.8)"; });
+  dz.addEventListener("dragleave", ()=> dz.style.borderColor="rgba(255,255,255,0.18)");
+  dz.addEventListener("drop", e=>{ e.preventDefault(); dz.style.borderColor="rgba(255,255,255,0.18)"; if(e.dataTransfer.files && e.dataTransfer.files[0]){ fi.files = e.dataTransfer.files; showMeta(fi.files[0]); }});
   fi.addEventListener("change", ()=> showMeta(fi.files[0]));
 })();
 
-// Timer & actions
-let timerId = null, t0 = 0;
-function startTimer(){ stopTimer(); t0 = performance.now(); timerId = setInterval(()=>{
-  const secs = (performance.now() - t0)/1000;
-  $("timer").textContent = (secs < 60) ? secs.toFixed(2) + " s" : (Math.floor(secs/60) + "m " + (secs%60).toFixed(1) + "s");
-}, 100);}
-function stopTimer(final=false){ if(timerId){ clearInterval(timerId); timerId=null; }
-  if(final){ const secs=(performance.now()-t0)/1000;
-    $("timer").textContent = (secs < 60) ? secs.toFixed(2) + " s" : (Math.floor(secs/60) + "m " + (secs%60).toFixed(1) + "s");
-  }}
-function updateCounters(){
-  const txt = $("md").value || "";
-  $("charcount").textContent = txt.length.toString();
-  $("linecount").textContent = (txt ? txt.split(/\r?\n/).length : 0).toString();
-}
-$("copy").onclick = async ()=>{
-  try{ await navigator.clipboard.writeText($("md").value || "");
-    $("status").textContent = "Markdown copié";
-    setTimeout(()=>{$("status").textContent="";}, 1400);
-  }catch(_){ $("status").textContent = "Impossible de copier."; }
-};
-$("clear").onclick = ()=>{
-  $("md").value = ""; $("meta").value = ""; $("download").style.display = "none"; updateCounters();
-  $("status").textContent = "Zones effacées."; setTimeout(()=>{$("status").textContent="";}, 1200);
-};
-$("convert").onclick = async () => {
-  const f = $("file").files[0];
-  if(!f){ alert("Choisis un fichier."); return; }
-  $("convert").disabled = true; $("status").textContent = "Conversion en cours...";
-  $("md").value = ""; $("meta").value = ""; $("download").style.display = "none";
-  $("progress").style.display = "block"; startTimer();
-  const fd = new FormData();
-  fd.append("file", f);
-  fd.append("use_plugins", $("plugins").checked ? "true" : "false");
-  fd.append("use_llm", $("llm").checked ? "true" : "false");
-  fd.append("docintel_endpoint", $("di").value || "");
-  fd.append("force_ocr", $("forceocr").checked ? "true" : "false");
+let timerId=null, t0=0;
+function startTimer(){ stopTimer(); t0=performance.now(); timerId=setInterval(()=>{ const s=(performance.now()-t0)/1000; $("timer").textContent = s<60? s.toFixed(2)+" s" : (Math.floor(s/60)+"m "+(s%60).toFixed(1)+"s"); }, 100); }
+function stopTimer(final=false){ if(timerId){ clearInterval(timerId); timerId=null; } if(final){ const s=(performance.now()-t0)/1000; $("timer").textContent = s<60? s.toFixed(2)+" s" : (Math.floor(s/60)+"m "+(s%60).toFixed(1)+"s"); } }
+function updateCounters(){ const txt=$("md").value||""; $("charcount").textContent=txt.length; $("linecount").textContent=(txt? txt.split(/\r?\n/).length:0); }
+$("copy").onclick=async()=>{ try{ await navigator.clipboard.writeText($("md").value||""); $("status").textContent="Markdown copié"; setTimeout(()=>{$("status").textContent="";},1200);}catch{ $("status").textContent="Impossible de copier"; }};
+$("clear").onclick=()=>{ $("md").value=""; $("meta").value=""; $("download").style.display="none"; updateCounters(); $("status").textContent="Zones effacées."; setTimeout(()=>{$("status").textContent="";},1200); };
+
+$("convert").onclick = async ()=>{
+  const f=$("file").files[0]; if(!f){ alert("Choisis un fichier."); return; }
+  $("convert").disabled=true; $("status").textContent="Conversion en cours..."; $("md").value=""; $("meta").value=""; $("download").style.display="none"; $("progress").style.display="block"; startTimer();
+  const fd=new FormData(); fd.append("file", f); fd.append("use_plugins", $("plugins").checked?"true":"false"); fd.append("use_llm", $("llm").checked?"true":"false"); fd.append("docintel_endpoint", $("di").value||""); fd.append("force_ocr", $("forceocr").checked?"true":"false");
   try{
-    const res = await fetch(endpoint, { method:"POST", body: fd });
-    if(!res.ok){ throw new Error("HTTP "+res.status); }
-    const json = await res.json();
-    $("md").value = json.markdown || "";
-    $("meta").value = JSON.stringify(json.metadata || {}, null, 2);
-    updateCounters();
-    const blob = new Blob([$("md").value], {type:"text/markdown;charset=utf-8"});
-    const url  = URL.createObjectURL(blob);
-    const a = $("download");
-    a.href = url;
-    a.download = (json.output_filename || "sortie.md");
-    a.style.display = "inline-flex";
-    $("status").textContent = "OK";
-  }catch(e){
-    $("status").textContent = "Erreur : " + (e && e.message ? e.message : e);
-  }finally{
-    $("convert").disabled = false;
-    $("progress").style.display = "none";
-    stopTimer(true);
-  }
+    const res=await fetch(endpoint,{method:"POST",body:fd}); if(!res.ok) throw new Error("HTTP "+res.status);
+    const json=await res.json(); $("md").value=json.markdown||""; $("meta").value=JSON.stringify(json.metadata||{},null,2);
+    const blob=new Blob([$("md").value],{type:"text/markdown;charset=utf-8"}); const url=URL.createObjectURL(blob); const a=$("download"); a.href=url; a.download=(json.output_filename||"sortie.md"); a.style.display="inline-flex";
+    updateCounters(); $("status").textContent="OK";
+  }catch(e){ $("status").textContent="Erreur : "+(e&&e.message?e.message:e); }
+  finally{ $("convert").disabled=false; $("progress").style.display="none"; stopTimer(true); }
 };
 $("md").addEventListener("input", updateCounters);
 </script>
@@ -1024,6 +905,7 @@ def index():
 def get_config():
     return JSONResponse({"docintel_default": DEFAULT_DOCINTEL_ENDPOINT})
 
+
 # ---------------------------
 # Endpoint API de conversion
 # ---------------------------
@@ -1032,16 +914,16 @@ async def convert(
     file: UploadFile = File(...),
     use_plugins: bool = Form(False),
     docintel_endpoint: Optional[str] = Form(None),
-    llm_model: Optional[str] = Form(None),   # compat
+    llm_model: Optional[str] = Form(None),
     use_llm: bool = Form(False),
     force_ocr: bool = Form(False),
 ):
     """
     Règles:
     - DOCX/XLSX/CSV : pipelines dédiés
-    - PDF + (plugins & force_ocr & OCR_ENABLED) : pipeline PyMuPDF inline amélioré
+    - PDF + (plugins & force_ocr & OCR_ENABLED) : pipeline PyMuPDF inline (texte + images OCR smart)
     - Sinon : MarkItDown + cleanup
-    - Images seules : OCR + embed conditionnel
+    - Image seule : OCR + embed conditionnel
     """
     try:
         t_start = time.perf_counter()
@@ -1077,8 +959,10 @@ async def convert(
         elif is_csv:
             markdown = csv_to_md_bytes(content)
 
-        # PDF — pipeline inline amélioré
-        elif is_pdf and use_plugins and force_ocr and OCR_ENABLED:
+        # PDF — pipeline inline amélioré (texte + images OCR smart)
+        elif is_pdf and use_plugins and OCR_ENABLED and (force_ocr or True):
+            # (on laisse cocher/décocher dans l’UI; même sans "force_ocr",
+            #  l'image-OCR smart reste disponible via IMAGE_OCR_MODE)
             markdown, meta_pdf = render_pdf_markdown_inline(content)
             metadata.update(meta_pdf)
 
@@ -1094,8 +978,8 @@ async def convert(
                 metadata["warnings"] = warnings
             markdown = _md_cleanup(markdown)
 
-            # Image seule + Forcer OCR
-            if force_ocr and OCR_ENABLED and is_img:
+            # Image seule + OCR conditionnel
+            if OCR_ENABLED and (force_ocr or True) and is_img:
                 ocr_text, score = ocr_image_bytes(content, OCR_LANGS)
                 if ocr_text.strip():
                     markdown += "\n\n# OCR (extrait)\n" + ocr_text
@@ -1149,7 +1033,6 @@ async def convert(
 
         # Durée
         metadata["duration_sec"] = round(time.perf_counter() - t_start, 3)
-
         if SAVE_UPLOADS and in_path:
             metadata["saved_input_path"] = in_path
         if SAVE_OUTPUTS and out_path:
@@ -1166,6 +1049,7 @@ async def convert(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Conversion error: {type(e).__name__}: {e}")
+
 
 # ---------------------------
 # Healthcheck
