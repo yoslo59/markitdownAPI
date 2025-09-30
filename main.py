@@ -474,7 +474,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
         doc.close()
 
 # ---------------------------
-# Mini interface web (même UI, sans icônes) + timer
+# Mini interface web (dark mode) + timer
 # ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
@@ -483,91 +483,235 @@ HTML_PAGE = r'''<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>MarkItDown UI</title>
   <style>
-    :root{color-scheme:light dark}
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,'Helvetica Neue',Arial; padding:24px; max-width:1000px; margin:auto; line-height:1.5}
-    h1{margin:0 0 .25rem 0; font-size:1.6rem}
-    .sub{color:#6b7280; font-size:.9rem; margin-bottom:14px}
-    .card{border:1px solid #e5e7eb; border-radius:14px; padding:16px; margin-top:14px; box-shadow:0 1px 2px rgba(0,0,0,.06)}
+    :root{
+      color-scheme: dark;
+      --bg: #0b0f14;
+      --bg2: #0e141b;
+      --card: rgba(255,255,255,0.06);
+      --card-border: rgba(255,255,255,0.08);
+      --text: #e6edf3;
+      --muted: #9fb0bf;
+      --accent: #63b3ff;        /* bleu doux */
+      --accent-2: #8f7aff;      /* violet doux */
+      --ok: #58d68d;
+      --err: #ff6b6b;
+      --shadow: 0 6px 24px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.03);
+      --radius: 16px;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      color:var(--text);
+      background:
+        radial-gradient(1000px 600px at 20% -10%, #183a58 0%, transparent 60%),
+        radial-gradient(900px 500px at 120% 10%, #3b2d6a 0%, transparent 55%),
+        linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
+      background-attachment: fixed;
+      line-height:1.55;
+      padding:32px 20px 40px;
+    }
+    h1{margin:0 0 .35rem 0; font-size:1.65rem; letter-spacing:.2px}
+    .sub{color:var(--muted); font-size:.95rem; margin-bottom:18px}
+
+    .container{max-width:1060px; margin:0 auto}
+
+    .card{
+      background:var(--card);
+      border:1px solid var(--card-border);
+      border-radius:var(--radius);
+      box-shadow:var(--shadow);
+      padding:18px;
+      margin-top:16px;
+      backdrop-filter: blur(8px);
+    }
     .row{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
     label{font-weight:600}
-    button{padding:10px 16px; border:1px solid #111; border-radius:10px; background:#111; color:#fff; cursor:pointer}
-    button.secondary{background:transparent; color:#111}
-    button:disabled{opacity:.55; cursor:not-allowed}
-    textarea{width:100%; min-height:260px; padding:12px; border-radius:10px; border:1px solid #e5e7eb; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-    .muted{color:#6b7280; font-size:.85rem}
-    input[type="checkbox"]{transform:scale(1.15)}
-    a#download{padding:10px 16px; border:1px solid #111; border-radius:10px; text-decoration:none}
-    input[type="text"]{padding:8px 10px; border:1px solid #e5e7eb; border-radius:10px; min-width:420px}
 
-    .drop{border:2px dashed #d1d5db; border-radius:12px; padding:18px; text-align:center; cursor:pointer; transition:.15s border-color ease}
-    .drop:hover{border-color:#9ca3af}
-    .drop.active{border-color:#111; background:rgba(17,17,17,.03)}
-    .filemeta{font-size:.9rem; color:#374151}
+    input[type="text"], input[type="file"], textarea{
+      background:rgba(255,255,255,0.03);
+      color:var(--text);
+      border:1px solid rgba(255,255,255,0.12);
+      border-radius:12px;
+      padding:10px 12px;
+      outline:none;
+      transition:border .15s ease, box-shadow .15s ease;
+    }
+    input[type="text"]:focus, textarea:focus{
+      border-color:var(--accent);
+      box-shadow:0 0 0 3px rgba(99,179,255,.15);
+    }
 
-    .progress{height:8px; background:#f3f4f6; border-radius:999px; overflow:hidden; display:none; margin-top:8px}
-    .bar{height:100%; width:40%; background:#111; border-radius:999px; animation:slide 1.2s infinite}
+    textarea{
+      width:100%;
+      min-height:280px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size:.95rem;
+      resize: vertical;
+    }
+
+    button{
+      padding:10px 16px;
+      border-radius:12px;
+      border:1px solid rgba(255,255,255,0.12);
+      color:#0b0f14;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      cursor:pointer;
+      font-weight:700;
+      letter-spacing:.2px;
+      transition:transform .06s ease, filter .15s ease, opacity .2s ease;
+    }
+    button:hover{ filter:brightness(1.08) }
+    button:active{ transform:translateY(1px) }
+    button:disabled{ opacity:.55; cursor:not-allowed; filter:none }
+
+    .btn-ghost{
+      background:transparent;
+      color:var(--text);
+      border-color:rgba(255,255,255,0.16);
+    }
+
+    a#download{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:10px 16px; border-radius:12px;
+      border:1px solid rgba(255,255,255,0.16);
+      text-decoration:none; color:var(--text);
+      background:rgba(255,255,255,0.03);
+      transition:background .15s ease, border-color .15s ease;
+    }
+    a#download:hover{ background:rgba(255,255,255,0.06); border-color:rgba(255,255,255,0.28) }
+
+    .muted{color:var(--muted)}
+
+    /* Dropzone */
+    .drop{
+      border:1.5px dashed rgba(255,255,255,0.18);
+      border-radius:14px;
+      padding:18px;
+      text-align:center;
+      cursor:pointer;
+      transition:.15s border-color ease, background .15s ease;
+      background:rgba(255,255,255,0.02);
+    }
+    .drop:hover{border-color:rgba(255,255,255,0.35)}
+    .drop.active{border-color:var(--accent); background:rgba(99,179,255,.06)}
+
+    .filemeta{font-size:.95rem; color:var(--text); opacity:.9}
+
+    /* Switches */
+    .switch{position:relative; display:inline-block; width:44px; height:24px}
+    .switch input{opacity:0; width:0; height:0}
+    .slider{
+      position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0;
+      background:rgba(255,255,255,0.12); transition:.2s; border-radius:999px; border:1px solid rgba(255,255,255,0.2);
+    }
+    .slider:before{
+      position:absolute; content:""; height:18px; width:18px; left:2px; top:2.5px;
+      background:white; transition:.2s; border-radius:50%;
+    }
+    .switch input:checked + .slider{
+      background:linear-gradient(135deg, var(--accent), var(--accent-2));
+      border-color:transparent;
+    }
+    .switch input:checked + .slider:before{ transform:translateX(20px) }
+
+    /* Progress (indéterminée) */
+    .progress{height:10px; background:rgba(255,255,255,0.08); border-radius:999px; overflow:hidden; display:none; margin-top:10px}
+    .bar{height:100%; width:40%; background:linear-gradient(135deg, var(--accent), var(--accent-2)); border-radius:999px; animation:slide 1.2s infinite}
     @keyframes slide{0%{transform:translateX(-100%)}50%{transform:translateX(50%)}100%{transform:translateX(150%)}}
 
-    .stats{display:flex; gap:16px; align-items:center; margin-top:8px}
-    .tag{display:inline-flex; gap:6px; align-items:center; background:#f3f4f6; border:1px solid #e5e7eb; border-radius:999px; padding:6px 10px; font-size:.85rem}
-    .tag b{font-weight:700}
+    /* Stats chips */
+    .stats{display:flex; gap:12px; align-items:center; margin-top:10px; flex-wrap:wrap}
+    .tag{
+      display:inline-flex; gap:6px; align-items:center;
+      background:rgba(255,255,255,0.05);
+      border:1px solid rgba(255,255,255,0.15);
+      border-radius:999px; padding:6px 10px; font-size:.9rem
+    }
+    .tag b{font-weight:800}
+
+    /* Header band */
+    .hero{
+      background: linear-gradient(135deg, rgba(99,179,255,.14), rgba(143,122,255,.18));
+      border:1px solid rgba(255,255,255,0.12);
+      border-radius: 18px;
+      padding: 16px 18px;
+      box-shadow: var(--shadow);
+      margin-bottom: 18px;
+    }
   </style>
 </head>
 <body>
-  <h1>MarkItDown — Conversion</h1>
-  <div class="sub">Plugins seul : MarkItDown → Markdown. Plugins + Forcer OCR (PDF) : texte + OCR / images in-place. Résumé Azure LLM en option.</div>
-
-  <div class="card">
-    <div class="row">
-      <label for="file">Fichier :</label>
-      <input id="file" type="file" />
-      <div class="filemeta" id="filemeta"></div>
+  <div class="container">
+    <div class="hero">
+      <h1>MarkItDown — Conversion</h1>
+      <div class="sub">Plugins seul : MarkItDown → Markdown. Plugins + Forcer OCR (PDF) : texte + OCR / images inline. Résumé Azure LLM en option.</div>
     </div>
 
-    <div class="drop" id="dropzone" tabindex="0" aria-label="Déposez un fichier ici">
-      Glissez-déposez votre fichier ici (ou utilisez le champ ci-dessus)
+    <div class="card">
+      <div class="row">
+        <label for="file">Fichier :</label>
+        <input id="file" type="file" />
+        <div class="filemeta" id="filemeta"></div>
+      </div>
+
+      <div class="drop" id="dropzone" tabindex="0" aria-label="Déposez un fichier ici">
+        Glissez-déposez votre fichier ici (ou utilisez le champ ci-dessus)
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <label for="plugins">Activer plugins MarkItDown</label>
+        <label class="switch">
+          <input id="plugins" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+
+        <label for="llm">Résumé Azure LLM</label>
+        <label class="switch">
+          <input id="llm" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+
+        <label for="forceocr">Forcer OCR</label>
+        <label class="switch">
+          <input id="forceocr" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="row" style="margin-top:12px; gap:8px; align-items:baseline;">
+        <label for="di">Endpoint Azure Document Intelligence</label>
+        <input id="di" type="text" placeholder="https://<resource>.cognitiveservices.azure.com/"/>
+        <span class="muted">Optionnel (MarkItDown)</span>
+      </div>
+
+      <div class="row" style="margin-top:12px; gap:10px">
+        <button id="convert">Convertir</button>
+        <a id="download" download="sortie.md" style="display:none">Télécharger Markdown</a>
+        <button id="copy" class="btn-ghost" title="Copier le Markdown">Copier</button>
+        <button id="clear" class="btn-ghost" title="Vider les zones">Vider</button>
+      </div>
+
+      <div class="stats">
+        <span class="tag">Durée: <b id="timer">0.00 s</b></span>
+        <span class="tag">Lignes MD: <b id="linecount">0</b></span>
+        <span class="tag">Caractères: <b id="charcount">0</b></span>
+        <span id="status" class="muted" style="margin-left:auto"></span>
+      </div>
+
+      <div class="progress" id="progress"><div class="bar"></div></div>
     </div>
 
-    <div class="row" style="margin-top:10px">
-      <label for="plugins">Activer plugins MarkItDown</label>
-      <input id="plugins" type="checkbox" />
-      <label for="llm">Résumé Azure LLM</label>
-      <input id="llm" type="checkbox" />
-      <label for="forceocr">Forcer OCR</label>
-      <input id="forceocr" type="checkbox" />
+    <div class="card">
+      <label>Markdown</label>
+      <textarea id="md" spellcheck="false"></textarea>
     </div>
 
-    <div class="row" style="margin-top:10px; gap:8px; align-items:baseline;">
-      <label for="di">Endpoint Azure Document Intelligence</label>
-      <input id="di" type="text" placeholder="https://<resource>.cognitiveservices.azure.com/"/>
-      <span class="muted">Optionnel (MarkItDown)</span>
+    <div class="card">
+      <label>Métadonnées (JSON)</label>
+      <textarea id="meta" style="min-height:160px" spellcheck="false"></textarea>
     </div>
-
-    <div class="row" style="margin-top:10px; gap:10px">
-      <button id="convert">Convertir</button>
-      <a id="download" download="sortie.md" style="display:none">Télécharger Markdown</a>
-      <button id="copy" class="secondary" title="Copier le Markdown">Copier</button>
-      <button id="clear" class="secondary" title="Vider les zones">Vider</button>
-    </div>
-
-    <div class="stats">
-      <span class="tag">Durée: <b id="timer">0.00 s</b></span>
-      <span class="tag">Lignes MD: <b id="linecount">0</b></span>
-      <span class="tag">Caractères: <b id="charcount">0</b></span>
-      <span id="status" class="muted" style="margin-left:auto"></span>
-    </div>
-
-    <div class="progress" id="progress"><div class="bar"></div></div>
-  </div>
-
-  <div class="card">
-    <label>Markdown</label>
-    <textarea id="md" spellcheck="false"></textarea>
-  </div>
-
-  <div class="card">
-    <label>Métadonnées (JSON)</label>
-    <textarea id="meta" style="min-height:140px" spellcheck="false"></textarea>
   </div>
 
 <script>
@@ -578,7 +722,7 @@ fetch("/config").then(r=>r.ok?r.json():null).then(j=>{
   if(j && j.docintel_default){ $("di").value = j.docintel_default; }
 }).catch(()=>{});
 
-// Drag & drop helpers
+// Drag & drop
 (function(){
   const dz = $("dropzone");
   const fi = $("file");
@@ -642,7 +786,7 @@ $("copy").onclick = async ()=>{
   try{
     await navigator.clipboard.writeText($("md").value || "");
     $("status").textContent = "Markdown copié";
-    setTimeout(()=>{$("status").textContent="";}, 1500);
+    setTimeout(()=>{$("status").textContent="";}, 1400);
   }catch(_){
     $("status").textContent = "Impossible de copier (permissions).";
   }
@@ -688,7 +832,7 @@ $("convert").onclick = async () => {
     const a = $("download");
     a.href = url;
     a.download = (json.output_filename || "sortie.md");
-    a.style.display = "inline-block";
+    a.style.display = "inline-flex";
     $("status").textContent = "OK";
   }catch(e){
     $("status").textContent = "Erreur : " + (e && e.message ? e.message : e);
