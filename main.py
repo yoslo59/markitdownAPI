@@ -57,9 +57,14 @@ OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
 # Prétraitements OCR avancés
 OCR_DESKEW         = os.getenv("OCR_DESKEW", "true").lower() == "true"
 OCR_BINARIZE       = os.getenv("OCR_BINARIZE", "true").lower() == "true"
-OCR_TEXT_QUALITY_MIN = float(os.getenv("OCR_TEXT_QUALITY_MIN", "0.18"))  # filtre anti-bruit
-OCR_MIN_OCR_WIDTH    = int(os.getenv("OCR_MIN_OCR_WIDTH", "1300"))       # upscale avant OCR
+OCR_TEXT_QUALITY_MIN = float(os.getenv("OCR_TEXT_QUALITY_MIN", "0.30"))   # filtre anti-bruit
+OCR_MIN_OCR_WIDTH    = int(os.getenv("OCR_MIN_OCR_WIDTH", "1500"))        # upscale avant OCR
 OCR_AUTO_INVERT      = os.getenv("OCR_AUTO_INVERT", "true").lower() == "true"
+
+# Contrôle agressivité OCR images / fallback
+OCR_DISABLE_PAGE_FALLBACK = os.getenv("OCR_DISABLE_PAGE_FALLBACK", "true").lower() == "true"
+IMAGE_OCR_MODE = os.getenv("IMAGE_OCR_MODE", "conservative").strip()  # conservative|always|never
+IMAGE_OCR_MIN_WORDS = int(os.getenv("IMAGE_OCR_MIN_WORDS", "12"))
 
 # Images base64
 EMBED_IMAGES       = os.getenv("EMBED_IMAGES", "ocr_only").strip()  # none | ocr_only | all
@@ -78,7 +83,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="3.2")
+app = FastAPI(title="MarkItDown API", version="3.3-conservative-ocr")
 
 app.add_middleware(
     CORSMiddleware,
@@ -120,7 +125,7 @@ def guess_is_csv(filename: str) -> bool:
     return filename.lower().endswith(".csv")
 
 def _md_cleanup(md: str) -> str:
-    """Post-format léger + nettoyage."""
+    """Post-format léger + nettoyage + filtre de gros blocs ASCII bruyants."""
     if not md:
         return md
     lines = []
@@ -137,6 +142,23 @@ def _md_cleanup(md: str) -> str:
         txt,
         flags=re.S
     )
+
+    # Supprime blocs code 'text' manifestement bruités
+    def _is_noise_block(b: str) -> bool:
+        if not b:
+            return False
+        n = len(b)
+        if n < 1200:
+            return False
+        alnum = sum(ch.isalnum() for ch in b)
+        return (alnum / n) < 0.05
+
+    txt = re.sub(
+        r"```text\n(.*?)\n```",
+        lambda m: "" if _is_noise_block(m.group(1)) else m.group(0),
+        txt, flags=re.S
+    )
+
     # Pandas markdown leftovers
     txt = txt.replace(" NaN", " ").replace("NaN", " ")
     return txt.strip()
@@ -240,6 +262,7 @@ def _wrap_tables_as_code(txt: str) -> str:
     return "\n".join(out)
 
 _alnum = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
 def _ocr_quality_score(txt: str) -> float:
     """
     Score 'lisibilité' 0–1.
@@ -262,6 +285,9 @@ def _ocr_quality_score(txt: str) -> float:
     base = 0.5*alnum_ratio + 0.5*min(1.0, n/600)
     score = max(0.0, min(1.0, base - penalty_symbols - penalty_garb + bonus_words))
     return score
+
+def _count_plausible_words(txt: str) -> int:
+    return len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{3,}", txt or ""))
 
 def _ocr_image_best(im: Image.Image, langs: str) -> Tuple[str, float]:
     # 1) Préparations
@@ -375,63 +401,6 @@ def _classify_heading(size: float, size_levels: List[float]) -> Optional[str]:
 _bullet_re = re.compile(r"^\s*(?:[-–—•·●◦▪]|\d+[.)])\s+")
 _table_border_re = re.compile(r"^\s*[+].*[-+].*[+]\s*$")
 
-def _median_font_size(page_raw: Dict[str,Any]) -> float:
-    sizes = []
-    for b in page_raw.get("blocks", []):
-        if b.get("type", 0) != 0:
-            continue
-        for l in b.get("lines", []):
-            for s in l.get("spans", []):
-                t = s.get("text","").strip()
-                if t:
-                    sizes.append(float(s.get("size",0)))
-    if not sizes:
-        return 0.0
-    sizes.sort()
-    mid = len(sizes)//2
-    return sizes[mid] if len(sizes)%2==1 else (sizes[mid-1]+sizes[mid])/2.0
-
-def _collect_sizes(doc: fitz.Document, sample_pages: int = 5) -> List[float]:
-    sizes = []
-    n = min(sample_pages, doc.page_count)
-    for p in range(n):
-        raw = doc.load_page(p).get_text("rawdict") or {}
-        for b in raw.get("blocks", []):
-            if b.get("type", 0) != 0:
-                continue
-            for l in b.get("lines", []):
-                for s in l.get("spans", []):
-                    t = s.get("text","").strip()
-                    if t:
-                        sizes.append(float(s.get("size",0)))
-    if not sizes:
-        return []
-    sizes = sorted(set(sizes), reverse=True)
-    return sizes[:6]
-
-def _line_to_md(spans: List[Dict[str,Any]], size_levels: List[float]) -> str:
-    parts = []
-    max_size = 0.0
-    for sp in spans:
-        t = sp.get("text","")
-        if not t:
-            continue
-        size = float(sp.get("size", 0))
-        max_size = max(max_size, size)
-        if _is_bold(int(sp.get("flags",0))):
-            parts.append(f"**{t}**")
-        else:
-            parts.append(t)
-    raw = "".join(parts).strip()
-    if not raw:
-        return ""
-    if _bullet_re.match(raw):
-        return raw
-    h = _classify_heading(max_size, size_levels)
-    if h and len(raw) < 180:
-        return f"{h} {raw}"
-    return raw
-
 def _median_line_height(page_raw: Dict[str, Any]) -> float:
     heights = []
     for b in page_raw.get("blocks", []):
@@ -502,7 +471,7 @@ def _ascii_table_to_md(block: str) -> Optional[str]:
     border_lines = [i for i, l in enumerate(lines) if _table_border_re.match(l)]
     if len(border_lines) < 2:
         return None
-    content = [l for l in lines if l.strip().startswith("|") and l.strip().endswith("|")]
+    content = [l for l in lines if l.strip().startsWith("|") and l.strip().endswith("|")] if hasattr(str, "startsWith") else [l for l in lines if l.strip().startswith("|") and l.strip().endswith("|")]
     if not content:
         return None
     rows = []
@@ -516,6 +485,47 @@ def _ascii_table_to_md(block: str) -> Optional[str]:
     df = pd.DataFrame(data=data, columns=header)
     df = df.where(df.notna(), "")
     return df.to_markdown(index=False, tablefmt="github")
+
+def _collect_sizes(doc: fitz.Document, sample_pages: int = 5) -> List[float]:
+    sizes = []
+    n = min(sample_pages, doc.page_count)
+    for p in range(n):
+        raw = doc.load_page(p).get_text("rawdict") or {}
+        for b in raw.get("blocks", []):
+            if b.get("type", 0) != 0:
+                continue
+            for l in b.get("lines", []):
+                for s in l.get("spans", []):
+                    t = s.get("text","").strip()
+                    if t:
+                        sizes.append(float(s.get("size",0)))
+    if not sizes:
+        return []
+    sizes = sorted(set(sizes), reverse=True)
+    return sizes[:6]
+
+def _line_to_md(spans: List[Dict[str,Any]], size_levels: List[float]) -> str:
+    parts = []
+    max_size = 0.0
+    for sp in spans:
+        t = sp.get("text","")
+        if not t:
+            continue
+        size = float(sp.get("size", 0))
+        max_size = max(max_size, size)
+        if _is_bold(int(sp.get("flags",0))):
+            parts.append(f"**{t}**")
+        else:
+            parts.append(t)
+    raw = "".join(parts).strip()
+    if not raw:
+        return ""
+    if _bullet_re.match(raw):
+        return raw
+    h = _classify_heading(max_size, size_levels)
+    if h and len(raw) < 180:
+        return f"{h} {raw}"
+    return raw
 
 def _guess_columns(atoms: List[Dict[str,Any]], max_cols: int = 3) -> List[Tuple[float,float]]:
     """
@@ -566,8 +576,8 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
       - Listes
       - Paragraphes fusionnés
       - Tables ASCII → tables Markdown
-      - Images OCR en plein res + embed redimensionné si besoin (quality-gate)
-      - Fallback OCR pleine page (quality-gate)
+      - Images OCR (quality-gate) + embed redimensionné si besoin
+      - Fallback OCR pleine page restreint aux pages sans texte vectoriel
       - Tri lecture multi-colonnes robuste
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -635,18 +645,25 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                     if im_full is None:
                         continue
 
-                    txt, q = _ocr_image_best(im_full, OCR_LANGS)
-
-                    im_embed = _pil_resize_max(im_full, IMG_MAX_WIDTH)
-
                     area_ratio = ((x1-x0)*(y1-y0))/page_area
                     is_background_like = area_ratio > 0.85
 
                     md_img = ""
-                    if txt and q >= OCR_TEXT_QUALITY_MIN and not is_background_like:
+                    txt, q = "", 0.0
+
+                    # Politique OCR image
+                    do_img_ocr = (IMAGE_OCR_MODE == "always") or \
+                                 (IMAGE_OCR_MODE == "conservative" and not is_background_like)
+
+                    if do_img_ocr:
+                        txt, q = _ocr_image_best(im_full, OCR_LANGS)
+
+                    # Filtre dur: qualité ET nombre de mots
+                    if txt and q >= OCR_TEXT_QUALITY_MIN and _count_plausible_words(txt) >= IMAGE_OCR_MIN_WORDS:
                         md_img = _wrap_tables_as_code(txt.strip())
                     else:
                         if EMBED_IMAGES in ("all", "ocr_only"):
+                            im_embed = _pil_resize_max(im_full, IMG_MAX_WIDTH)
                             data_uri = _pil_to_base64(im_embed, IMG_FORMAT, IMG_JPEG_QUALITY)
                             md_img = f'![{IMG_ALT_PREFIX} – page {p+1}]({data_uri})'
 
@@ -705,30 +722,23 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
 
             flush_para()
 
-            # Fallback OCR pleine page si la page reste pauvre en texte
-            page_text_chars = sum(len(x) for x in page_buf if x and not x.strip().startswith("!["))
-            if page_text_chars < OCR_MIN_CHARS:
+            # Fallback OCR pleine page ?
+            has_vector_text = any(a["kind"] == "text" for a in atoms)
+            if not has_vector_text and not OCR_DISABLE_PAGE_FALLBACK:
                 try:
                     best_txt, best_score = "", -1e9
                     for d in OCR_DPI_CANDIDATES:
                         im_page = _raster_pdf_page(page, d)
-                        txt, score = _ocr_image_best(im_page, OCR_LANGS)
-                        if score > best_score:
-                            best_txt, best_score = txt, score
+                        t, s = _ocr_image_best(im_page, OCR_LANGS)
+                        if len(t) > len(best_txt) and s > best_score:
+                            best_txt, best_score = t, s
                         if best_score >= OCR_SCORE_GOOD_ENOUGH:
                             break
-                    if best_txt.strip():
-                        # Quality gate global
-                        if _ocr_quality_score(best_txt) >= OCR_TEXT_QUALITY_MIN:
-                            page_buf.append("<!-- OCR page fallback -->")
-                            blocks = _merge_wrapped_paragraphs(best_txt.splitlines())
-                            for block in blocks:
-                                if _table_chars.search(block) and ("|" in block or "+" in block):
-                                    md_tbl = _ascii_table_to_md(block)
-                                    if md_tbl:
-                                        page_buf.append(md_tbl)
-                                        continue
-                                page_buf.append(_wrap_tables_as_code(block))
+                    if best_txt.strip() and _ocr_quality_score(best_txt) >= OCR_TEXT_QUALITY_MIN and _count_plausible_words(best_txt) >= IMAGE_OCR_MIN_WORDS:
+                        page_buf.append("<!-- OCR page fallback (no vector text) -->")
+                        blocks = _merge_wrapped_paragraphs(best_txt.splitlines())
+                        for block in blocks:
+                            page_buf.append(_wrap_tables_as_code(block))
                 except Exception:
                     pass
 
@@ -838,7 +848,7 @@ HTML_PAGE = r'''<!doctype html>
   <div class="container">
     <div class="hero">
       <h1>MarkItDown — Conversion</h1>
-      <div class="sub">PDF/Images → Markdown hiérarchisé (+ OCR). DOCX/XLSX/CSV → Markdown propre (tables). Résumé Azure en option.</div>
+      <div class="sub">PDF/Images → Markdown hiérarchisé (+ OCR conservateur). DOCX/XLSX/CSV → Markdown propre (tables). Résumé Azure en option.</div>
     </div>
 
     <div class="card">
