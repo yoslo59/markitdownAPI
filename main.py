@@ -17,9 +17,9 @@ import pytesseract
 from PIL import Image, ImageOps, ImageFilter
 import fitz  # PyMuPDF
 
-# === NEW: data & vision utils
+# Data & vision utils
 import pandas as pd
-import numpy as np  # IMPORTANT: requis pour OpenCV pipeline
+import numpy as np  # requis par OpenCV
 try:
     import cv2  # OpenCV (headless)
     _HAS_CV2 = True
@@ -53,9 +53,13 @@ OCR_TABLE_MODE     = os.getenv("OCR_TABLE_MODE", "true").lower() == "true"
 OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,3,4,11").split(",")]
 OCR_DPI_CANDIDATES = [int(x) for x in os.getenv("OCR_DPI_CANDIDATES", "300,350,400").split(",")]
 OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
-# Prétraitements
+
+# Prétraitements OCR avancés
 OCR_DESKEW         = os.getenv("OCR_DESKEW", "true").lower() == "true"
 OCR_BINARIZE       = os.getenv("OCR_BINARIZE", "true").lower() == "true"
+OCR_TEXT_QUALITY_MIN = float(os.getenv("OCR_TEXT_QUALITY_MIN", "0.18"))  # filtre anti-bruit
+OCR_MIN_OCR_WIDTH    = int(os.getenv("OCR_MIN_OCR_WIDTH", "1300"))       # upscale avant OCR
+OCR_AUTO_INVERT      = os.getenv("OCR_AUTO_INVERT", "true").lower() == "true"
 
 # Images base64
 EMBED_IMAGES       = os.getenv("EMBED_IMAGES", "ocr_only").strip()  # none | ocr_only | all
@@ -74,7 +78,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="3.1")
+app = FastAPI(title="MarkItDown API", version="3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -187,6 +191,25 @@ def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
     g = g.point(lambda p: 255 if p > 190 else (0 if p < 110 else p))
     return g
 
+def _maybe_invert_dark(im: Image.Image) -> Image.Image:
+    """Inverse si fond global sombre -> Tesseract préfère fond clair / texte sombre."""
+    if not OCR_AUTO_INVERT:
+        return im
+    g = ImageOps.grayscale(im)
+    hist = g.histogram()
+    mean = sum(hist[i]*i for i in range(256)) / max(1, sum(hist))
+    if mean < 115:  # seuil empirique
+        return ImageOps.invert(im.convert("RGB"))
+    return im
+
+def _upscale_min_width(im: Image.Image, min_w: int) -> Image.Image:
+    """Upscale (LANCZOS) si l’image est trop petite pour un OCR lisible."""
+    if im.width >= min_w:
+        return im
+    ratio = min_w / float(im.width)
+    new_h = int(im.height * ratio)
+    return im.resize((min_w, new_h), Image.LANCZOS)
+
 def _score_text_for_table(txt: str) -> float:
     if not txt:
         return 0.0
@@ -216,31 +239,79 @@ def _wrap_tables_as_code(txt: str) -> str:
         out.extend(buf); out.append("```")
     return "\n".join(out)
 
+_alnum = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+def _ocr_quality_score(txt: str) -> float:
+    """
+    Score 'lisibilité' 0–1.
+    - ratio alphanumérique,
+    - longueur utile,
+    - pénalités pour séquences de symboles,
+    - bonus si on voit des mots de 3–12 chars.
+    """
+    if not txt:
+        return 0.0
+    t = txt.replace("\n", " ").strip()
+    if not t:
+        return 0.0
+    n = len(t)
+    alnum_ratio = sum(ch in _alnum for ch in t) / n
+    penalty_symbols = 0.15 if re.search(r"[§¤©«»≈±÷×¤□◆◇●■□•◦◻◼]", t) else 0.0
+    penalty_garb   = 0.15 if re.search(r"[^\w\s]{6,}", t) else 0.0
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{3,12}", t)
+    bonus_words = min(0.25, 0.02 * len(words))
+    base = 0.5*alnum_ratio + 0.5*min(1.0, n/600)
+    score = max(0.0, min(1.0, base - penalty_symbols - penalty_garb + bonus_words))
+    return score
+
 def _ocr_image_best(im: Image.Image, langs: str) -> Tuple[str, float]:
+    # 1) Préparations
     if im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
-    # OpenCV preprocessing first if available
-    try:
-        im2 = _opencv_preprocess_for_ocr(im) if _HAS_CV2 else _preprocess_for_ocr(im)
-    except Exception:
-        im2 = _preprocess_for_ocr(im)
 
+    # Upscale pour atteindre une largeur “lisible”
+    try:
+        im_pre = _upscale_min_width(im, OCR_MIN_OCR_WIDTH)
+    except Exception:
+        im_pre = im
+
+    # Inversion si fond sombre
+    try:
+        im_pre = _maybe_invert_dark(im_pre)
+    except Exception:
+        pass
+
+    # OpenCV/PIL preprocessing
+    try:
+        im2 = _opencv_preprocess_for_ocr(im_pre) if _HAS_CV2 else _preprocess_for_ocr(im_pre)
+    except Exception:
+        im2 = _preprocess_for_ocr(im_pre)
+
+    # 2) Multi-PSM
     best_txt, best_score = "", -1e9
     for psm in OCR_PSMS:
         cfg = _tess_config(psm, OCR_KEEP_SPACES, OCR_TABLE_MODE)
-        t1 = pytesseract.image_to_string(im, lang=langs, config=cfg) or ""
+        t1 = pytesseract.image_to_string(im_pre, lang=langs, config=cfg) or ""
         s1 = _score_text_for_table(t1)
         cand_txt, cand_score = t1, s1
+
         if OCR_TWO_PASS:
             t2 = pytesseract.image_to_string(im2, lang=langs, config=cfg) or ""
             s2 = _score_text_for_table(t2)
             if s2 > cand_score:
                 cand_txt, cand_score = t2, s2
+
         if cand_score > best_score:
             best_txt, best_score = cand_txt, cand_score
+
         if best_score >= OCR_SCORE_GOOD_ENOUGH:
             break
-    return best_txt.strip(), best_score
+
+    # 3) Quality gate final (filtre anti-bruit)
+    q = _ocr_quality_score(best_txt)
+    if q < OCR_TEXT_QUALITY_MIN:
+        return "", q  # on préfère ne rien insérer
+
+    return best_txt.strip(), q
 
 def ocr_image_bytes(img_bytes: bytes, langs: str) -> Tuple[str, float]:
     with Image.open(io.BytesIO(img_bytes)) as im:
@@ -297,7 +368,7 @@ def _classify_heading(size: float, size_levels: List[float]) -> Optional[str]:
     if not size_levels:
         return None
     for idx, s in enumerate(size_levels[:6], start=1):
-        if size >= s * 0.98:  # légère tolérance
+        if size >= s * 0.98:
             return "#" * idx
     return None
 
@@ -495,8 +566,8 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
       - Listes
       - Paragraphes fusionnés
       - Tables ASCII → tables Markdown
-      - Images OCR en plein res + embed redimensionné si besoin
-      - Fallback OCR pleine page
+      - Images OCR en plein res + embed redimensionné si besoin (quality-gate)
+      - Fallback OCR pleine page (quality-gate)
       - Tri lecture multi-colonnes robuste
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -549,7 +620,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                         })
 
                 elif btype == 1:
-                    # IMAGE — OCR sur pleine résolution, embed redimensionné
+                    # IMAGE — OCR sur pleine résolution, embed redimensionné (quality-gate)
                     im_full = crop_bbox_image(page, bbox, OCR_DPI)
                     if im_full is None:
                         info = b.get("image")
@@ -564,17 +635,17 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                     if im_full is None:
                         continue
 
-                    txt, score = _ocr_image_best(im_full, OCR_LANGS)
+                    txt, q = _ocr_image_best(im_full, OCR_LANGS)
 
                     im_embed = _pil_resize_max(im_full, IMG_MAX_WIDTH)
 
                     area_ratio = ((x1-x0)*(y1-y0))/page_area
                     is_background_like = area_ratio > 0.85
 
-                    if txt and score >= OCR_SCORE_GOOD_ENOUGH and not is_background_like:
+                    md_img = ""
+                    if txt and q >= OCR_TEXT_QUALITY_MIN and not is_background_like:
                         md_img = _wrap_tables_as_code(txt.strip())
                     else:
-                        md_img = ""
                         if EMBED_IMAGES in ("all", "ocr_only"):
                             data_uri = _pil_to_base64(im_embed, IMG_FORMAT, IMG_JPEG_QUALITY)
                             md_img = f'![{IMG_ALT_PREFIX} – page {p+1}]({data_uri})'
@@ -647,15 +718,17 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                         if best_score >= OCR_SCORE_GOOD_ENOUGH:
                             break
                     if best_txt.strip():
-                        page_buf.append("<!-- OCR page fallback -->")
-                        blocks = _merge_wrapped_paragraphs(best_txt.splitlines())
-                        for block in blocks:
-                            if _table_chars.search(block) and ("|" in block or "+" in block):
-                                md_tbl = _ascii_table_to_md(block)
-                                if md_tbl:
-                                    page_buf.append(md_tbl)
-                                    continue
-                            page_buf.append(_wrap_tables_as_code(block))
+                        # Quality gate global
+                        if _ocr_quality_score(best_txt) >= OCR_TEXT_QUALITY_MIN:
+                            page_buf.append("<!-- OCR page fallback -->")
+                            blocks = _merge_wrapped_paragraphs(best_txt.splitlines())
+                            for block in blocks:
+                                if _table_chars.search(block) and ("|" in block or "+" in block):
+                                    md_tbl = _ascii_table_to_md(block)
+                                    if md_tbl:
+                                        page_buf.append(md_tbl)
+                                        continue
+                                page_buf.append(_wrap_tables_as_code(block))
                 except Exception:
                     pass
 
@@ -1016,7 +1089,7 @@ async def convert(
                 ocr_text, score = ocr_image_bytes(content, OCR_LANGS)
                 if ocr_text.strip():
                     markdown += "\n\n# OCR (extrait)\n" + ocr_text
-                if EMBED_IMAGES in ("all", "ocr_only") and (not ocr_text or score < OCR_SCORE_GOOD_ENOUGH):
+                if EMBED_IMAGES in ("all", "ocr_only") and (not ocr_text or score < OCR_TEXT_QUALITY_MIN):
                     try:
                         with Image.open(io.BytesIO(content)) as im:
                             im_embed = _pil_resize_max(im, IMG_MAX_WIDTH)
