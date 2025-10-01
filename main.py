@@ -641,7 +641,7 @@ HTML_PAGE = r'''<!doctype html>
   <div class="container">
     <div class="card">
       <h1>MarkItDown — Conversion</h1>
-      <div class="sub">Plugins seul : MarkItDown → Markdown. Plugins + Forcer OCR (PDF) : texte + OCR des captures (smart). Résumé Azure LLM en option.</div>
+      <div class="sub">Conversion Markdown + OCR et Base64</div>
     </div>
 
     <div class="card">
