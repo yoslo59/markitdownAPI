@@ -1,24 +1,22 @@
 FROM python:3.12-slim
 
+# Installer dépendances système (ffmpeg éventuellement nécessaire pour certaines conversions)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    tesseract-ocr \
-    tesseract-ocr-fra \
-    tesseract-ocr-eng \
-    curl \
- && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/*
 
+# Installer dépendances Python (MarkItDown + FastAPI + PaddleOCR et ses libs)
 RUN pip install --no-cache-dir \
     "markitdown[all]" \
     fastapi \
     uvicorn \
     python-multipart \
-    openai \
     pymupdf \
-    pytesseract \
-    pillow \
+    Pillow \
     opencv-python-headless \
-    pandas
+    pandas \
+    paddlepaddle \
+    paddleocr
 
 WORKDIR /app
 COPY main.py /app/main.py
