@@ -14,7 +14,14 @@ import cv2
 from PIL import Image
 
 # PaddleOCR pipeline (for OCR modes)
-from paddleocr import PaddleOCR, PPStructure
+try:
+    from paddleocr import PaddleOCR, PPStructureV3 as PPStructure
+except ImportError:
+    # fallback pour anciennes versions (si dispo)
+    from paddleocr import PaddleOCR, PPStructure
+
+import numpy as np  
+import time
 
 # ---------------------------
 # Config via variables d'environnement
@@ -173,10 +180,9 @@ def ocr_page_fast(page: fitz.Page) -> Tuple[str, bool]:
     Retourne le markdown de la page et un indicateur si du texte a été extrait.
     """
     # Rasteriser la page entière en image
-    pil_page = Image.frombytes("RGB", [page.rect.width, page.rect.height],
-                               page.get_pixmap(matrix=fitz.Matrix(OCR_DPI/72, OCR_DPI/72), alpha=False).samples)
-    # Conversion en image OpenCV (BGR)
-    cv_page = cv2.cvtColor(np.array(pil_page), cv2.COLOR_RGB2BGR) if 'np' in globals() else cv2.imread(page)  # ensure numpy is imported
+    pix = page.get_pixmap(matrix=fitz.Matrix(OCR_DPI/72, OCR_DPI/72), alpha=False)
+    pil_page = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    cv_page = cv2.cvtColor(np.array(pil_page), cv2.COLOR_RGB2BGR)
     ocr = get_paddle_ocr()
     result = ocr.ocr(cv_page, cls=False)  # liste de [ [poly, (text, conf)], ... ]
     items: List[Dict[str, Any]] = []
