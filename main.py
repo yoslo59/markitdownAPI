@@ -42,7 +42,7 @@ OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,4,3,11").split
 OCR_DPI_CANDIDATES = [int(x) for x in os.getenv("OCR_DPI_CANDIDATES", "300,350,400").split(",")]
 OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
 
-# Image OCR policy
+# Politique OCR images & fallback
 IMAGE_OCR_MODE = os.getenv("IMAGE_OCR_MODE", "smart").strip()  # smart | conservative | always | never
 IMAGE_OCR_MIN_WORDS = int(os.getenv("IMAGE_OCR_MIN_WORDS", "10"))
 OCR_TEXT_QUALITY_MIN = float(os.getenv("OCR_TEXT_QUALITY_MIN", "0.30"))
@@ -66,7 +66,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="3.5-stable")
+app = FastAPI(title="MarkItDown API", version="3.6-fix-ui-text+imgocr")
 
 app.add_middleware(
     CORSMiddleware,
@@ -99,7 +99,6 @@ def guess_is_image(filename: str, content_type: Optional[str]) -> bool:
     return any(filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"))
 
 def _md_cleanup(md: str) -> str:
-    """Post-format léger pour la sortie MarkItDown: listes/titres/tableaux ASCII."""
     if not md:
         return md
     lines = []
@@ -109,19 +108,18 @@ def _md_cleanup(md: str) -> str:
         l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)  # "1)" -> "1. "
         lines.append(l)
     txt = "\n".join(lines)
-    # encadre blocs ASCII
+    # Encadrer grilles ASCII en ```text
     txt = re.sub(
         r"(?:^|\n)((?:[|+\-=_].*\n){2,})",
         lambda m: "```text\n" + m.group(1).strip() + "\n```",
-        txt,
-        flags=re.S
+        txt, flags=re.S
     )
     return txt.strip()
 
 # ---------------------------
 # OCR utils
 # ---------------------------
-_table_chars = re.compile(r"[|+\-=_]{3,}")  # heuristique ASCII
+_table_chars = re.compile(r"[|+\-=_]{3,}")
 
 def _tess_config(psm: str) -> str:
     cfg = f"--psm {psm} --oem 1"
@@ -168,8 +166,10 @@ def _fast_has_text(im: Image.Image, langs: str, min_words: int) -> bool:
 def _classify_ocr_block(txt: str) -> str:
     t = (txt or "").strip()
     if not t: return ""
+    # Tables ASCII
     if re.search(r"^\s*[+].*[-+].*[+]\s*$", t, flags=re.M) or re.search(r"^\s*\|.*\|\s*$", t, flags=re.M):
         return f"```text\n{t}\n```"
+    # Console / SQL
     if re.search(r"^\s*(\$|#)\s", t, flags=re.M) or "mysql>" in t:
         if re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|SHOW|GRANT|CHANGE\s+MASTER|START\s+(SLAVE|REPLICA))\b", t, flags=re.I):
             return f"```sql\n{t}\n```"
@@ -282,10 +282,7 @@ def _line_to_md(spans: List[Dict[str,Any]], median_size: float) -> str:
             continue
         size = float(sp.get("size", 0))
         max_size = max(max_size, size)
-        if _is_bold(int(sp.get("flags",0))):
-            parts.append(f"**{t}**")
-        else:
-            parts.append(t)
+        parts.append(f"**{t}**" if _is_bold(int(sp.get("flags",0))) else t)
     raw = "".join(parts).strip()
     if not raw:
         return ""
@@ -331,7 +328,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
             page_h = page.rect.height
             page_area = max(1.0, page_w * page_h)
 
-            # 1) Texte (par LIGNE) + images (à traiter après décision OCR)
+            # 1) TEXTE (par LIGNE) + marquage images (traitées ensuite)
             for b in raw.get("blocks", []):
                 btype = b.get("type", 0)
                 bbox = tuple(b.get("bbox", (0,0,0,0)))
@@ -373,16 +370,15 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
 
             has_vector_text = any(a["kind"] == "text" for a in atoms)
 
-            # 2) Traiter les images : OCR smart + quality gate
+            # 2) IMAGES -> OCR "smart" ou embed
             processed = []
             for a in atoms:
                 if a["kind"] != "image_raw":
                     processed.append(a); continue
 
-                x0,y0,x1,y1 = a["bbox"]
                 im = crop_bbox_image(page, a["bbox"], OCR_DPI)
                 if im is None:
-                    processed.append(a); continue
+                    continue
 
                 area_ratio = a["area_ratio"]
                 is_background_like = area_ratio > 0.85
@@ -394,7 +390,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                     do_img_ocr = (not is_background_like) and _fast_has_text(im, OCR_LANGS, IMAGE_OCR_MIN_WORDS)
                 elif IMAGE_OCR_MODE == "conservative":
                     do_img_ocr = (not is_background_like)
-                # "never" -> False
+                # "never": False
 
                 md_img = ""
                 txt, q = "", 0.0
@@ -420,7 +416,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
 
             atoms = processed
 
-            # 3) Tri lecture : bandes verticales (simple)
+            # 3) Tri lecture simple (haut → bas, gauche → droite)
             def sort_key(a):
                 x0,y0,x1,y1 = a["bbox"]
                 y_center = 0.5*(y0+y1)
@@ -457,7 +453,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
                     page_buf.append(md)
             flush_para()
 
-            # 5) Fallback OCR de page : seulement si pas de texte vectoriel ET autorisé
+            # 5) Fallback OCR page : UNIQUEMENT si pas de texte vectoriel ET autorisé
             if not has_vector_text and not OCR_DISABLE_PAGE_FALLBACK:
                 try:
                     best_txt, best_score = "", -1e9
@@ -483,7 +479,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str,Any]]:
         doc.close()
 
 # ---------------------------
-# Mini interface web (identique à l’original)
+# UI web (exactement comme ton origine, avec sliders .switch)
 # ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
@@ -510,41 +506,128 @@ HTML_PAGE = r'''<!doctype html>
     *{box-sizing:border-box}
     html,body{height:100%}
     body{
-      margin:0; color:var(--text);
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      color:var(--text);
       background:
         radial-gradient(1000px 600px at 20% -10%, #183a58 0%, transparent 60%),
         radial-gradient(900px 500px at 120% 10%, #3b2d6a 0%, transparent 55%),
         linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
-      background-attachment: fixed; line-height:1.55; padding:32px 20px 40px;
-      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      background-attachment: fixed;
+      line-height:1.55;
+      padding:32px 20px 40px;
     }
-    h1{margin:0 0 .35rem 0; font-size:1.65rem}
+    h1{margin:0 0 .35rem 0; font-size:1.65rem; letter-spacing:.2px}
     .sub{color:var(--muted); font-size:.95rem; margin-bottom:18px}
     .container{max-width:1060px; margin:0 auto}
-    .card{background:var(--card); border:1px solid var(--card-border); border-radius:var(--radius); box-shadow:var(--shadow); padding:18px; margin-top:16px; backdrop-filter: blur(8px);}
+    .card{
+      background:var(--card);
+      border:1px solid var(--card-border);
+      border-radius:var(--radius);
+      box-shadow:var(--shadow);
+      padding:18px;
+      margin-top:16px;
+      backdrop-filter: blur(8px);
+    }
     .row{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
     label{font-weight:600}
     input[type="text"], input[type="file"], textarea{
-      background:rgba(255,255,255,0.03); color:var(--text);
-      border:1px solid rgba(255,255,255,0.12); border-radius:12px; padding:10px 12px;
+      background:rgba(255,255,255,0.03);
+      color:var(--text);
+      border:1px solid rgba(255,255,255,0.12);
+      border-radius:12px;
+      padding:10px 12px;
+      outline:none;
+      transition:border .15s ease, box-shadow .15s ease;
     }
-    textarea{width:100%; min-height:280px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size:.95rem; resize: vertical;}
-    button{padding:10px 16px; border-radius:12px; border:1px solid rgba(255,255,255,0.12); color:#0b0f14; background: linear-gradient(135deg, var(--accent), var(--accent-2)); cursor:pointer; font-weight:700;}
-    .btn-ghost{background:transparent; color:var(--text); border-color:rgba(255,255,255,0.16)}
-    a#download{display:inline-flex; align-items:center; gap:8px; padding:10px 16px; border-radius:12px; border:1px solid rgba(255,255,255,0.16); text-decoration:none; color:var(--text); background:rgba(255,255,255,0.03)}
+    input[type="text"]:focus, textarea:focus{
+      border-color:var(--accent);
+      box-shadow:0 0 0 3px rgba(99,179,255,.15);
+    }
+    textarea{
+      width:100%;
+      min-height:280px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size:.95rem;
+      resize: vertical;
+    }
+    button{
+      padding:10px 16px;
+      border-radius:12px;
+      border:1px solid rgba(255,255,255,0.12);
+      color:#0b0f14;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      cursor:pointer;
+      font-weight:700;
+      letter-spacing:.2px;
+      transition:transform .06s ease, filter .15s ease, opacity .2s ease;
+    }
+    button:hover{ filter:brightness(1.08) }
+    button:active{ transform:translateY(1px) }
+    button:disabled{ opacity:.55; cursor:not-allowed; filter:none }
+    .btn-ghost{
+      background:transparent;
+      color:var(--text);
+      border-color:rgba(255,255,255,0.16);
+    }
+    a#download{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:10px 16px; border-radius:12px;
+      border:1px solid rgba(255,255,255,0.16);
+      text-decoration:none; color:var(--text);
+      background:rgba(255,255,255,0.03);
+    }
     .muted{color:var(--muted)}
-    .drop{ border:1.5px dashed rgba(255,255,255,0.18); border-radius:14px; padding:18px; text-align:center; cursor:pointer; background:rgba(255,255,255,0.02) }
+
+    /* Dropzone */
+    .drop{
+      border:1.5px dashed rgba(255,255,255,0.18);
+      border-radius:14px;
+      padding:18px;
+      text-align:center;
+      cursor:pointer;
+      transition:.15s border-color ease, background .15s ease;
+      background:rgba(255,255,255,0.02);
+    }
     .drop:hover{border-color:rgba(255,255,255,0.35)}
+    .drop.active{border-color:var(--accent); background:rgba(99,179,255,.06)}
+
+    .filemeta{font-size:.95rem; color:var(--text); opacity:.9}
+
+    /* Switches (sliders) */
+    .switch{position:relative; display:inline-block; width:44px; height:24px}
+    .switch input{opacity:0; width:0; height:0}
+    .slider{
+      position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0;
+      background:rgba(255,255,255,0.12); transition:.2s; border-radius:999px; border:1px solid rgba(255,255,255,0.2);
+    }
+    .slider:before{
+      position:absolute; content:""; height:18px; width:18px; left:2px; top:2.5px;
+      background:white; transition:.2s; border-radius:50%;
+    }
+    .switch input:checked + .slider{
+      background:linear-gradient(135deg, var(--accent), var(--accent-2));
+      border-color:transparent;
+    }
+    .switch input:checked + .slider:before{ transform:translateX(20px) }
+
     .progress{height:10px; background:rgba(255,255,255,0.08); border-radius:999px; overflow:hidden; display:none; margin-top:10px}
     .bar{height:100%; width:40%; background:linear-gradient(135deg, var(--accent), var(--accent-2)); border-radius:999px; animation:slide 1.2s infinite}
     @keyframes slide{0%{transform:translateX(-100%)}50%{transform:translateX(50%)}100%{transform:translateX(150%)}}
+
     .stats{display:flex; gap:12px; align-items:center; margin-top:10px; flex-wrap:wrap}
-    .tag{display:inline-flex; gap:6px; align-items:center; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); border-radius:999px; padding:6px 10px; font-size:.9rem}
+    .tag{
+      display:inline-flex; gap:6px; align-items:center;
+      background:rgba(255,255,255,0.05);
+      border:1px solid rgba(255,255,255,0.15);
+      border-radius:999px; padding:6px 10px; font-size:.9rem
+    }
+    .tag b{font-weight:800}
   </style>
 </head>
 <body>
   <div class="container">
-    <div class="card hero">
+    <div class="card">
       <h1>MarkItDown — Conversion</h1>
       <div class="sub">Plugins seul : MarkItDown → Markdown. Plugins + Forcer OCR (PDF) : texte + OCR des captures (smart). Résumé Azure LLM en option.</div>
     </div>
@@ -553,7 +636,7 @@ HTML_PAGE = r'''<!doctype html>
       <div class="row">
         <label for="file">Fichier :</label>
         <input id="file" type="file" />
-        <div class="muted" id="filemeta"></div>
+        <div class="filemeta" id="filemeta"></div>
       </div>
 
       <div class="drop" id="dropzone" tabindex="0" aria-label="Déposez un fichier ici">
@@ -562,13 +645,22 @@ HTML_PAGE = r'''<!doctype html>
 
       <div class="row" style="margin-top:12px">
         <label for="plugins">Activer plugins MarkItDown</label>
-        <input id="plugins" type="checkbox" />
+        <label class="switch">
+          <input id="plugins" type="checkbox" />
+          <span class="slider"></span>
+        </label>
 
         <label for="llm">Résumé Azure LLM</label>
-        <input id="llm" type="checkbox" />
+        <label class="switch">
+          <input id="llm" type="checkbox" />
+          <span class="slider"></span>
+        </label>
 
         <label for="forceocr">Forcer OCR</label>
-        <input id="forceocr" type="checkbox" />
+        <label class="switch">
+          <input id="forceocr" type="checkbox" />
+          <span class="slider"></span>
+        </label>
       </div>
 
       <div class="row" style="margin-top:12px; gap:8px; align-items:baseline;">
@@ -612,7 +704,7 @@ const endpoint = "/convert";
 // drag & drop + meta
 (function(){
   const dz = $("dropzone"), fi = $("file"), fm = $("filemeta");
-  function prettySize(bytes){ if(bytes < 1024) return bytes+" B"; if(bytes < 1048576) return (bytes/1024).toFixed(1)+" KB"; return (bytes/1048576).toFixed(1)+" MB"; }
+  function prettySize(bytes){ if(bytes < 1024) return bytes + " B"; if(bytes < 1048576) return (bytes/1024).toFixed(1) + " KB"; return (bytes/1048576).toFixed(1) + " MB"; }
   function showMeta(f){ fm.textContent = f ? `${f.name} — ${prettySize(f.size)}` : ""; }
   dz.addEventListener("click", ()=> fi.click());
   dz.addEventListener("dragover", e=>{ e.preventDefault(); dz.classList.add("active"); });
@@ -699,9 +791,9 @@ async def convert(
     force_ocr: bool = Form(False),
 ):
     """
-    - Rien coché ou Plugins seul : MarkItDown (+ post-format).
-    - Plugins (PDF) : pipeline PyMuPDF (texte vectoriel + OCR d’images smart + fallback page contrôlé).
-    - Image seule + Forcer OCR : OCR + image base64 si OCR pauvre.
+    - Plugins OFF : MarkItDown simple (+ cleanup).
+    - Plugins ON (PDF) : PyMuPDF inline → texte vectoriel + OCR “smart” des captures, fallback page seulement si pas de texte.
+    - Image seule : OCR + base64 si OCR pauvre.
     """
     try:
         t_start = time.perf_counter()
@@ -725,14 +817,13 @@ async def convert(
 
         metadata: Dict[str,Any] = {}
 
-        # === PDF + Plugins => pipeline inline (toujours). force_ocr influe juste sur fallback page.
         if is_pdf and use_plugins and OCR_ENABLED:
-            # on autorise fallback page uniquement si force_ocr=true ET page sans texte vectoriel (géré dans la fonction)
+            # pipeline PDF inline (texte + images OCR smart)
             markdown, meta_pdf = render_pdf_markdown_inline(content)
             metadata.update(meta_pdf)
 
         else:
-            # === Pipeline MarkItDown (fonctionne même si plugins = False)
+            # MarkItDown générique
             md_engine = MarkItDown(enable_plugins=use_plugins, docintel_endpoint=docintel_endpoint)
             result = md_engine.convert_stream(io.BytesIO(content), file_name=file.filename)
 
@@ -745,8 +836,8 @@ async def convert(
             # post-traitement léger Markdown
             markdown = _md_cleanup(markdown)
 
-            # Image seule + OCR (si demandé ou utile)
-            if (force_ocr or is_img) and OCR_ENABLED and is_img:
+            # Image seule + OCR
+            if OCR_ENABLED and is_img:
                 ocr_text, score = ocr_image_bytes(content, OCR_LANGS)
                 if ocr_text.strip():
                     markdown += "\n\n# OCR (extrait)\n" + ocr_text
