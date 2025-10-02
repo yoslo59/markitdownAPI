@@ -3,106 +3,221 @@ import io
 import re
 import time
 import base64
-import tempfile
-from typing import Optional, List, Dict, Any
-
-import numpy as np
-from PIL import Image
+from typing import Optional, Tuple, List, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# ---- Libs pour les formats ----
-import fitz  # PyMuPDF (PDF)
-import pandas as pd  # CSV/XLSX
-from zipfile import ZipFile  # images DOCX
-try:
-    import docx  # python-docx
-except ImportError:
-    docx = None
+from markitdown import MarkItDown
+from openai import AzureOpenAI
 
-# MarkItDown est optionnel: si présent on s'en sert pour certains formats
-try:
-    from markitdown import MarkItDown
-except Exception:
-    MarkItDown = None
+# OCR libs
+import pytesseract
+from PIL import Image, ImageOps, ImageFilter
+import fitz  # PyMuPDF
 
-# ---- PaddleOCR ----
-from paddleocr import PaddleOCR, PPStructureV3
-
-# =========================
+# ---------------------------
 # Config via variables d'env
-# =========================
-SAVE_UPLOADS = os.getenv("SAVE_UPLOADS", "false").lower() == "true"
-SAVE_OUTPUTS = os.getenv("SAVE_OUTPUTS", "false").lower() == "true"
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/data/uploads")
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/data/outputs")
+# ---------------------------
+SAVE_UPLOADS  = os.getenv("SAVE_UPLOADS", "false").lower() == "true"
+SAVE_OUTPUTS  = os.getenv("SAVE_OUTPUTS", "false").lower() == "true"
+UPLOAD_DIR    = os.getenv("UPLOAD_DIR", "/data/uploads")
+OUTPUT_DIR    = os.getenv("OUTPUT_DIR", "/data/outputs")
 
-# OCR
-DEFAULT_OCR_LANGS = os.getenv("OCR_LANGS", "fra+eng").strip()
-OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "100"))
-OCR_DPI = int(os.getenv("OCR_DPI", "300"))  # rendu raster pour OCR PDF
+# Azure OpenAI
+AZURE_ENDPOINT   = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+AZURE_KEY        = os.getenv("AZURE_OPENAI_KEY", "").strip()
+AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "o4-mini").strip()
+AZURE_API_VER    = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview").strip()
 
-# Images intégrées
-EMBED_IMAGES = os.getenv("EMBED_IMAGES", "ocr_only").lower()  # "ocr_only" | "all"
-IMG_FORMAT = os.getenv("IMG_FORMAT", "png").lower()           # "png" | "jpeg"
-IMG_JPEG_QUALITY = int(os.getenv("IMG_JPEG_QUALITY", "85"))
-IMG_MAX_WIDTH = int(os.getenv("IMG_MAX_WIDTH", "1600"))
-IMG_ALT_PREFIX = os.getenv("IMG_ALT_PREFIX", "Capture")
+# OCR (tunable sans rebuild)
+OCR_ENABLED        = os.getenv("OCR_ENABLED", "true").lower() == "true"
+OCR_LANGS          = os.getenv("OCR_LANGS", "fra+eng").strip()
+OCR_DPI            = int(os.getenv("OCR_DPI", "350"))
+OCR_MAX_PAGES      = int(os.getenv("OCR_MAX_PAGES", "50"))
+OCR_MIN_CHARS      = int(os.getenv("OCR_MIN_CHARS", "500"))
+OCR_KEEP_SPACES    = os.getenv("OCR_KEEP_SPACES", "true").lower() == "true"
+OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,4,3,11").split(",")]
+OCR_DPI_CANDIDATES = [int(x) for x in os.getenv("OCR_DPI_CANDIDATES", "300,350,400").split(",")]
+OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
 
+# Politique OCR images & fallback
+IMAGE_OCR_MODE = os.getenv("IMAGE_OCR_MODE", "smart").strip()  # smart | conservative | always | never
+IMAGE_OCR_MIN_WORDS = int(os.getenv("IMAGE_OCR_MIN_WORDS", "10"))
+OCR_TEXT_QUALITY_MIN = float(os.getenv("OCR_TEXT_QUALITY_MIN", "0.30"))
+OCR_DISABLE_PAGE_FALLBACK = os.getenv("OCR_DISABLE_PAGE_FALLBACK", "false").lower() == "true"  # Fallback OCR pages sans texte activé par défaut
+
+# Embedding images base64
+# none | ocr_only | all
+EMBED_IMAGES       = os.getenv("EMBED_IMAGES", "ocr_only").strip()
+IMG_FORMAT         = os.getenv("IMG_FORMAT", "jpeg").strip().lower()
+IMG_JPEG_QUALITY   = int(os.getenv("IMG_JPEG_QUALITY", "85"))
+IMG_MAX_WIDTH      = int(os.getenv("IMG_MAX_WIDTH", "1600"))
+IMG_ALT_PREFIX     = os.getenv("IMG_ALT_PREFIX", "Capture").strip()
+
+# (Optionnel) Azure Document Intelligence
+DEFAULT_DOCINTEL_ENDPOINT = os.getenv("DEFAULT_DOCINTEL_ENDPOINT", "").strip()
+
+# Dossiers persistants
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# =========================
+# ---------------------------
 # App FastAPI
-# =========================
-app = FastAPI(title="Doc2Markdown (Paddle + MarkItDown)", version="1.0.0")
+# ---------------------------
+app = FastAPI(title="MarkItDown API", version="3.7-ocr-fallback+cleanup")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
+    allow_credentials=True,
+    allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
-# ==========
-# Utilitaires
-# ==========
-def _determine_lang_code(s: Optional[str]) -> str:
-    if not s:
-        s = DEFAULT_OCR_LANGS
-    s = s.strip().lower()
-    # PaddleOCR codes usuels
-    if "fra" in s or s.startswith("fr"):
-        return "fr"
-    if "eng" in s or s.startswith("en"):
-        return "en"
-    if "deu" in s or s.startswith("de"):
-        return "de"
-    if "es" in s or "spa" in s:
-        return "es"
-    if "jap" in s or s.startswith("ja"):
-        return "japan"
-    if "kor" in s or s.startswith("ko"):
-        return "korean"
-    if "zh" in s or "chi" in s:
-        return "ch"
-    # fallback (paddle sait "fr", "en", …)
-    return s
+def get_azure_client() -> Optional[AzureOpenAI]:
+    if AZURE_ENDPOINT and AZURE_KEY:
+        return AzureOpenAI(
+            azure_endpoint=AZURE_ENDPOINT,
+            api_key=AZURE_KEY,
+            api_version=AZURE_API_VER
+        )
+    return None
 
-_bullet_rx = re.compile(r"^\s*[•·●◦▪]\s+")
+# ---------------------------
+# Helpers génériques & markdown
+# ---------------------------
+def guess_is_pdf(filename: str, content_type: Optional[str]) -> bool:
+    if content_type and content_type.lower() in ("application/pdf", "pdf"):
+        return True
+    return filename.lower().endswith(".pdf")
+
+def guess_is_image(filename: str, content_type: Optional[str]) -> bool:
+    if content_type and content_type.lower().startswith("image/"):
+        return True
+    return any(filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"))
+
 def _md_cleanup(md: str) -> str:
     if not md:
         return md
     lines = []
     for L in md.replace("\r", "").split("\n"):
-        if _bullet_rx.match(L):
-            L = _bullet_rx.sub("- ", L)
-        # listes numérotées "1) " -> "1. "
-        L = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", L)
-        lines.append(L.rstrip())
-    return "\n".join(lines).strip()
+        l = re.sub(r"[ \t]+$", "", L)
+        l = re.sub(r"^\s*[•·●◦▪]\s+", "- ", l)         # bullets unicode -> '- '
+        l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)  # "1)" ou "1]" -> "1. "
+        lines.append(l)
+    txt = "\n".join(lines)
+    # Encadrer les grilles ASCII dans ```text
+    txt = re.sub(
+        r"(?:^|\n)((?:[|+\-=_].*\n){2,})",
+        lambda m: "```text\n" + m.group(1).strip() + "\n```",
+        txt, flags=re.S
+    )
+    return txt.strip()
 
+# ---------------------------
+# OCR utils
+# ---------------------------
+_table_chars = re.compile(r"[|+\-=_]{3,}")
+
+def _tess_config(psm: str) -> str:
+    cfg = f"--psm {psm} --oem 1"
+    if OCR_KEEP_SPACES:
+        cfg += " -c preserve_interword_spaces=1"
+    return cfg
+
+def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
+    g = ImageOps.grayscale(im)
+    g = ImageOps.autocontrast(g, cutoff=1)
+    g = g.filter(ImageFilter.MedianFilter(size=3))
+    g = g.point(lambda p: 255 if p > 190 else (0 if p < 110 else p))
+    return g
+
+def _score_text_for_table(txt: str) -> float:
+    if not txt:
+        return 0.0
+    lines = txt.splitlines()
+    n = max(1, len(lines))
+    pipes = sum(l.count("|") for l in lines)
+    plus  = sum(l.count("+") for l in lines)
+    dashes= sum(l.count("-") for l in lines)
+    ascii_blocks = sum(1 for l in lines if _table_chars.search(l))
+    return (pipes*1.0 + plus*0.6 + dashes*0.3 + ascii_blocks*2.0)/n + len(txt)/5000.0
+
+def _ocr_quality_score(txt: str) -> float:
+    if not txt:
+        return 0.0
+    t = txt.replace("\n", " ").strip()
+    if not t:
+        return 0.0
+    n = len(t)
+    alnum_ratio = sum(ch.isalnum() for ch in t) / n
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{3,12}", t)
+    return max(0.0, min(1.0, 0.5 * alnum_ratio + 0.5 * min(1.0, n/600) + 0.02 * len(words)))
+
+def _fast_has_text(im: Image.Image, langs: str, min_words: int) -> bool:
+    try:
+        data = pytesseract.image_to_data(im, lang=langs, config="--psm 11 --oem 1", output_type=pytesseract.Output.DICT)
+        words = [w for w in (data.get("text") or []) if w and re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{2,}", w)]
+        return len(words) >= min_words
+    except Exception:
+        return False
+
+def _classify_ocr_block(txt: str) -> str:
+    t = (txt or "").strip()
+    if not t:
+        return ""
+    # Tables ASCII détectées -> bloc de code
+    if re.search(r"^\s*\+.*[-+].*\+\s*$", t, flags=re.M) or re.search(r"^\s*\|.*\|\s*$", t, flags=re.M):
+        return f"```text\n{t}\n```"
+    # Lignes type console / SQL détectées -> bloc de code approprié
+    if re.search(r"^\s*(\$|#)\s", t, flags=re.M) or "mysql>" in t:
+        if re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|SHOW|GRANT|CHANGE\s+MASTER|START\s+(SLAVE|REPLICA))\b", t, flags=re.I):
+            return f"```sql\n{t}\n```"
+        return f"```bash\n{t}\n```"
+    return t
+
+def _ocr_image_best(im: Image.Image, langs: str) -> Tuple[str, float]:
+    # Appliquer OCR (plusieurs PSM, prétraitements) et renvoyer le meilleur texte + score qualité
+    if im.mode not in ("RGB", "L"):
+        im = im.convert("RGB")
+    im2 = _preprocess_for_ocr(im)
+    best_txt, best_score = "", -1e9
+    for psm in OCR_PSMS:
+        cfg = _tess_config(psm)
+        t1 = pytesseract.image_to_string(im, lang=langs, config=cfg) or ""
+        s1 = _score_text_for_table(t1)
+        cand_txt, cand_score = t1, s1
+        t2 = pytesseract.image_to_string(im2, lang=langs, config=cfg) or ""
+        s2 = _score_text_for_table(t2)
+        if s2 > cand_score:
+            cand_txt, cand_score = t2, s2
+        if cand_score > best_score:
+            best_txt, best_score = cand_txt, cand_score
+        if best_score >= OCR_SCORE_GOOD_ENOUGH:
+            break
+    q = _ocr_quality_score(best_txt)
+    if q < OCR_TEXT_QUALITY_MIN:
+        return "", q
+    return best_txt.strip(), q
+
+def ocr_image_bytes(img_bytes: bytes, langs: str) -> Tuple[str, float]:
+    # OCR d'une image isolée (renvoie texte OCRisé formaté + score qualité)
+    with Image.open(io.BytesIO(img_bytes)) as im:
+        txt, score = _ocr_image_best(im, langs)
+        return _classify_ocr_block(txt), score
+
+def _raster_pdf_page(page: fitz.Page, dpi: int) -> Image.Image:
+    # Rendu raster d'une page PDF entière à la résolution souhaitée
+    scale = dpi / 72.0
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+# ---------------------------
+# Images utilitaires
+# ---------------------------
 def _pil_resize_max(im: Image.Image, max_w: int) -> Image.Image:
     if max_w and im.width > max_w:
         ratio = max_w / im.width
@@ -110,7 +225,7 @@ def _pil_resize_max(im: Image.Image, max_w: int) -> Image.Image:
         return im.resize((max_w, new_h), Image.LANCZOS)
     return im
 
-def _pil_to_data_uri(im: Image.Image, fmt: str = "png", quality: int = 85) -> str:
+def _pil_to_base64(im: Image.Image, fmt: str = "png", quality: int = 85) -> str:
     buf = io.BytesIO()
     if fmt.lower() in ("jpeg", "jpg"):
         im = im.convert("RGB")
@@ -122,593 +237,711 @@ def _pil_to_data_uri(im: Image.Image, fmt: str = "png", quality: int = 85) -> st
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
-def _save_if_needed(path: str, data: bytes):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(data)
-
-def _guess_ext(name: str) -> str:
-    return os.path.splitext(name)[1].lower().lstrip(".")
-
-# =====================================
-# OCR engines (lazy init pour démarrage)
-# =====================================
-_ocr_basic: Optional[PaddleOCR] = None
-_ocr_struct: Optional[PPStructureV3] = None
-
-def get_ocr_basic(lang: str) -> PaddleOCR:
-    global _ocr_basic
-    if _ocr_basic is None or getattr(_ocr_basic, "_lang", "") != lang:
-        _ocr_basic = PaddleOCR(
-            lang=lang,
-            use_angle_cls=False,
-            show_log=False,
-            use_gpu=False
-        )
-        _ocr_basic._lang = lang
-    return _ocr_basic
-
-def get_ocr_struct(lang: str) -> PPStructureV3:
-    global _ocr_struct
-    # Un seul pipeline struct (langue multi-Latin ok). Si tu veux isoler par langue, dupliques comme basic.
-    if _ocr_struct is None:
-        _ocr_struct = PPStructureV3(
-            use_gpu=False,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False
-        )
-    return _ocr_struct
-
-# =====================
-# Conversions : TEXT-ONLY
-# =====================
-def pdf_text_only_md(pdf_bytes: bytes) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+def crop_bbox_image(page: fitz.Page, bbox: Tuple[float, float, float, float], dpi: int) -> Optional[Image.Image]:
     try:
-        parts = []
-        for i, page in enumerate(doc):
-            if i >= OCR_MAX_PAGES:
-                break
-            txt = page.get_text("text")
-            if txt.strip():
-                parts.append(txt.strip())
-        return _md_cleanup("\n\n".join(parts))
-    finally:
-        doc.close()
+        x0, y0, x1, y1 = bbox
+        rect = fitz.Rect(x0, y0, x1, y1)
+        zoom = dpi / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect, alpha=False)
+        return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    except Exception:
+        return None
 
-def docx_text_only_md(docx_bytes: bytes) -> str:
-    if docx is None:
-        # fallback MarkItDown si dispo
-        if MarkItDown:
-            md = MarkItDown()
-            res = md.convert_stream(io.BytesIO(docx_bytes), file_name="file.docx")
-            return _md_cleanup(getattr(res, "text_content", "") or "")
-        raise HTTPException(status_code=500, detail="python-docx n'est pas installé")
-    d = docx.Document(io.BytesIO(docx_bytes))
-    out = []
-    for p in d.paragraphs:
-        text = p.text or ""
-        if not text.strip():
+# ---------------------------
+# PDF inline : texte + images (OCR smart) + fallback contrôlé
+# ---------------------------
+def _is_bold(flags: int) -> bool:
+    return bool(flags & 1 or flags & 32)  # BOLD | FAKEBOLD
+
+def _median_font_size(page_raw: Dict[str, Any]) -> float:
+    sizes = []
+    for b in page_raw.get("blocks", []):
+        if b.get("type", 0) != 0:
             continue
-        style = (p.style.name or "") if p.style else ""
-        md_line = text
-        if style.startswith("Heading"):
-            try:
-                level = int(style.split()[-1])
-            except Exception:
-                level = 1
-            level = max(1, min(level, 6))
-            md_line = "#" * level + " " + text
-        out.append(md_line.strip())
-    # tables -> markdown
-    for t in d.tables:
-        rows = t.rows
-        if not rows:
+        for l in b.get("lines", []):
+            for s in l.get("spans", []):
+                if s.get("text", "").strip():
+                    sizes.append(float(s.get("size", 0)))
+    if not sizes:
+        return 0.0
+    sizes.sort()
+    mid = len(sizes) // 2
+    return sizes[mid] if len(sizes) % 2 == 1 else (sizes[mid-1] + sizes[mid]) / 2.0
+
+def _classify_heading(size: float, median_size: float) -> Optional[str]:
+    if median_size <= 0:
+        return None
+    if size >= median_size * 1.8: return "#"
+    if size >= median_size * 1.5: return "##"
+    if size >= median_size * 1.25: return "###"
+    return None
+
+_bullet_re = re.compile(r"^\s*(?:[-–—•·●◦▪]|\d+[.)])\s+")
+
+def _line_to_md(spans: List[Dict[str, Any]], median_size: float) -> str:
+    parts = []
+    max_size = 0.0
+    for sp in spans:
+        t = sp.get("text", "")
+        if not t:
             continue
-        # header
-        header = [c.text.strip() for c in rows[0].cells]
-        lines = []
-        lines.append("| " + " | ".join(header) + " |")
-        lines.append("|" + "|".join([" --- "] * len(header)) + "|")
-        for row in rows[1:]:
-            cells = [c.text.strip().replace("\n", "<br>") for c in row.cells]
-            lines.append("| " + " | ".join(cells) + " |")
-        out.append("\n".join(lines))
-    return _md_cleanup("\n\n".join(out))
+        size = float(sp.get("size", 0))
+        max_size = max(max_size, size)
+        parts.append(f"**{t}**" if _is_bold(int(sp.get("flags", 0))) else t)
+    raw = "".join(parts).strip()
+    if not raw:
+        return ""
+    h = _classify_heading(max_size, median_size)
+    if h and len(raw) < 180:
+        return f"{h} {raw}"
+    if _bullet_re.match(raw):
+        return raw
+    return raw
 
-def xlsx_csv_text_only_md(file_bytes: bytes, ext: str) -> str:
-    if ext == "csv":
-        # encodage robuste
-        txt = None
-        for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
-            try:
-                txt = file_bytes.decode(enc)
-                break
-            except Exception:
-                pass
-        if txt is None:
-            raise HTTPException(status_code=400, detail="Impossible de décoder le CSV")
-        df = pd.read_csv(io.StringIO(txt), dtype=str).fillna("")
-        return df.to_markdown(index=False)
-    # XLSX/XLS
-    try:
-        xl = pd.ExcelFile(io.BytesIO(file_bytes))
-        out = []
-        for sheet in xl.sheet_names:
-            df = pd.read_excel(xl, sheet_name=sheet, dtype=str).fillna("")
-            if len(xl.sheet_names) > 1:
-                out.append(f"## {sheet}")
-            out.append(df.to_markdown(index=False))
-        return "\n\n".join(out)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Lecture tableur échouée: {e}")
-
-# ===================================
-# Conversions : OCR / IMAGES & STRUCT
-# ===================================
-def pdf_quality_with_ocr(pdf_bytes: bytes, lang: str) -> str:
-    """
-    Mode qualité : structure + images en base64 + OCR des captures.
-    Utilise PPStructureV3 puis intègre les images en data URI.
-    """
-    # Ecrire sur disque (PPStructure marche mieux avec un chemin)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
-        f.write(pdf_bytes)
-        pdf_path = f.name
-    try:
-        pipeline = get_ocr_struct(lang)
-        results = pipeline.predict(input=pdf_path)  # liste de pages
-        # Concaténer markdown + collecter images
-        md_parts: List[Dict[str, Any]] = []
-        imgs: Dict[str, Image.Image] = {}
-        for res in results:
-            md_info = getattr(res, "markdown", None)
-            if isinstance(md_info, dict):
-                md_parts.append(md_info)
-                for k, v in (md_info.get("markdown_images") or {}).items():
-                    imgs[k] = v
-        try:
-            full_md = pipeline.concatenate_markdown_pages(md_parts)
-        except Exception:
-            full_md = "\n\n".join(p.get("markdown_text", "") for p in md_parts)
-        # Remplacer chemins d'images par data URI
-        for path, pil_img in imgs.items():
-            if pil_img is None:
-                continue
-            pil_img = _pil_resize_max(pil_img, IMG_MAX_WIDTH)
-            data_uri = _pil_to_data_uri(pil_img, IMG_FORMAT, IMG_JPEG_QUALITY)
-            full_md = full_md.replace(f"]({path})", f"]({data_uri})")
-        return _md_cleanup(full_md)
-    finally:
-        try:
-            os.remove(pdf_path)
-        except Exception:
-            pass
-
-def pdf_fast_ocr_text(pdf_bytes: bytes, lang: str) -> str:
-    """
-    Mode rapide : OCR ligne à ligne (texte), sans images intégrées.
-    Si la page a déjà du texte (couche texte PDF), on le garde.
-    """
-    ocr = get_ocr_basic(lang)
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        out = []
-        for i, page in enumerate(doc):
-            if i >= OCR_MAX_PAGES:
-                break
-            # Si texte natif dispo -> on prend
-            t = page.get_text("text")
-            if t.strip():
-                out.append(t.strip())
-                continue
-            # Sinon OCR de la page
-            pix = page.get_pixmap(matrix=fitz.Matrix(OCR_DPI/72, OCR_DPI/72))
-            im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            arr = np.array(im)
-            res = ocr.ocr(arr, cls=False) or []
-            lines = []
-            # PaddleOCR (v2.7.x) renvoie [[(box),(text,conf)],...]
-            for item in res:
-                if isinstance(item, list):
-                    for line in item:
-                        if isinstance(line, list) and len(line) > 1:
-                            txt = line[1][0]
-                            lines.append(txt)
-                else:
-                    # fallback
-                    try:
-                        lines.append(item[1][0])
-                    except Exception:
-                        pass
-            if lines:
-                out.append("\n".join(lines))
-        return _md_cleanup("\n\n".join(out))
-    finally:
-        doc.close()
-
-def docx_with_images_and_ocr(docx_bytes: bytes, lang: str, embed_images: bool = True, add_ocr_text: bool = True) -> str:
-    """
-    DOCX -> Markdown, images intégrées (base64), OCR des images si add_ocr_text=True (texte sous l'image).
-    """
-    if docx is None:
-        if MarkItDown:
-            md = MarkItDown()
-            res = md.convert_stream(io.BytesIO(docx_bytes), file_name="file.docx")
-            return _md_cleanup(getattr(res, "text_content", "") or "")
-        raise HTTPException(status_code=500, detail="python-docx non installé")
-    d = docx.Document(io.BytesIO(docx_bytes))
-    # Extraire toutes les images du package (fallback si relations manquantes)
-    image_data_map = {}
-    with ZipFile(io.BytesIO(docx_bytes)) as z:
-        for name in z.namelist():
-            if name.startswith("word/media/"):
-                image_data_map[name] = z.read(name)
-
-    ocr = get_ocr_basic(lang) if add_ocr_text else None
-    out: List[str] = []
-
-    # Paragraphes (avec bold/italic basique)
-    def fmt_run(run) -> str:
-        txt = run.text or ""
-        if not txt:
-            return ""
-        if run.bold and run.italic:
-            return f"***{txt}***"
-        if run.bold:
-            return f"**{txt}**"
-        if run.italic:
-            return f"*{txt}*"
+def _wrap_tables_as_code(txt: str) -> str:
+    if not txt:
         return txt
+    out, buf, in_blk = [], [], False
+    for line in txt.splitlines():
+        is_tbl = _table_chars.search(line) is not None or line.strip().startswith("|")
+        if is_tbl and not in_blk:
+            in_blk = True; out.append("```text"); buf = []
+        if in_blk and not is_tbl and buf:
+            out.extend(buf); out.append("```")
+            in_blk = False; out.append(line); buf = []; continue
+        if in_blk:
+            buf.append(line)
+        else:
+            out.append(line)
+    if in_blk:
+        out.extend(buf); out.append("```")
+    return "\n".join(out)
 
-    # Parcours du corps (paragraphes + tables)
-    body = d.element.body
-    table_idx = 0
-    for child in body.iterchildren():
-        if child.tag.endswith('}tbl'):
-            # Table
-            if table_idx >= len(d.tables):
-                continue
-            table = d.tables[table_idx]
-            table_idx += 1
-            rows = table.rows
-            if not rows:
-                continue
-            ncols = len(rows[0].cells)
-            lines = []
-            # header
-            head = []
-            for c in rows[0].cells:
-                cell_text = []
-                for p in c.paragraphs:
-                    for run in p.runs:
-                        cell_text.append(fmt_run(run))
-                head.append("".join(cell_text).strip())
-            lines.append("| " + " | ".join(head) + " |")
-            lines.append("|" + "|".join([" --- "] * ncols) + "|")
-            # data
-            for r in rows[1:]:
-                row_cells = []
-                for c in r.cells:
-                    parts = []
-                    for p in c.paragraphs:
-                        for run in p.runs:
-                            # image dans cellule ?
-                            if embed_images and run._element.xpath('.//w:drawing'):
-                                blips = run._element.xpath('.//a:blip', namespaces={'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
-                                if blips:
-                                    rId = blips[0].get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
-                                    img_bytes = None
-                                    if rId:
-                                        part = d.part.related_parts.get(rId)
-                                        if part and hasattr(part, 'blob'):
-                                            img_bytes = part.blob
-                                    if img_bytes is None and image_data_map:
-                                        img_bytes = next(iter(image_data_map.values()))
-                                    if img_bytes:
-                                        im = Image.open(io.BytesIO(img_bytes))
-                                        im = _pil_resize_max(im, IMG_MAX_WIDTH)
-                                        data_uri = _pil_to_data_uri(im, IMG_FORMAT, IMG_JPEG_QUALITY)
-                                        parts.append(f"![{IMG_ALT_PREFIX}]({data_uri})")
-                                        if add_ocr_text and ocr:
-                                            res = ocr.ocr(np.array(im), cls=False) or []
-                                            lines_ocr = []
-                                            for item in res:
-                                                if isinstance(item, list):
-                                                    for line in item:
-                                                        if isinstance(line, list) and len(line) > 1:
-                                                            lines_ocr.append(line[1][0])
-                                            if lines_ocr:
-                                                parts.append("\n" + "\n".join(lines_ocr))
-                            parts.append(fmt_run(run))
-                    row_cells.append("".join(parts).replace("\n", "<br>").strip())
-                lines.append("| " + " | ".join(row_cells) + " |")
-            out.append("\n".join(lines))
-        elif child.tag.endswith('}p'):
-            # Paragraphe
-            para = docx.text.paragraph.Paragraph(child, d)
-            style = para.style.name if para.style else ""
-            text_parts = []
-            prefix = ""
-            if style.startswith("Heading"):
+def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    md_lines: List[str] = []
+    meta: Dict[str, Any] = {"engine": "pymupdf_inline", "pages": doc.page_count}
+    try:
+        total_pages = min(doc.page_count, OCR_MAX_PAGES)
+        for p in range(total_pages):
+            page = doc.load_page(p)
+            raw = page.get_text("rawdict") or {}
+            median_size = _median_font_size(raw)
+            line_h_med = 12.0 if median_size == 0 else median_size * 1.0
+            band_h = max(8.0, line_h_med * 1.2)
+
+            atoms = []
+            page_w = page.rect.width
+            page_h = page.rect.height
+            page_area = max(1.0, page_w * page_h)
+
+            # 1) TEXTE (par LIGNE) + marquage images (traitées ensuite)
+            for b in raw.get("blocks", []):
+                btype = b.get("type", 0)
+                bbox = tuple(b.get("bbox", (0, 0, 0, 0)))
+                x0, y0, x1, y1 = bbox
+                x0 = max(0.0, min(x0, page_w)); x1 = max(0.0, min(x1, page_w))
+                y0 = max(0.0, min(y0, page_h)); y1 = max(0.0, min(y1, page_h))
+                bbox = (x0, y0, x1, y1)
+
+                if btype == 0:  # bloc texte
+                    for line in b.get("lines", []):
+                        spans = line.get("spans", [])
+                        if not spans:
+                            continue
+                        lx0 = min(s.get("bbox", [x0, y0, x1, y1])[0] for s in spans if s.get("bbox"))
+                        ly0 = min(s.get("bbox", [x0, y0, x1, y1])[1] for s in spans if s.get("bbox"))
+                        lx1 = max(s.get("bbox", [x0, y0, x1, y1])[2] for s in spans if s.get("bbox"))
+                        ly1 = max(s.get("bbox", [x0, y0, x1, y1])[3] for s in spans if s.get("bbox"))
+                        line_bbox = (lx0, ly0, lx1, ly1)
+
+                        md_line = _line_to_md(spans, median_size).strip()
+                        if not md_line:
+                            continue
+                        atoms.append({
+                            "bbox": line_bbox,
+                            "md": md_line,
+                            "kind": "text",
+                            "text_len": len(md_line),
+                            "area_ratio": ((lx1 - lx0) * (ly1 - ly0)) / page_area
+                        })
+
+                elif btype == 1:  # bloc image
+                    atoms.append({
+                        "bbox": bbox,
+                        "md": None,
+                        "kind": "image_raw",
+                        "text_len": 0,
+                        "area_ratio": ((x1 - x0) * (y1 - y0)) / page_area
+                    })
+
+            has_vector_text = any(a["kind"] == "text" for a in atoms)
+
+            # 2) IMAGES -> OCR (selon mode) ou embed base64
+            processed = []
+            for a in atoms:
+                if a["kind"] != "image_raw":
+                    processed.append(a)
+                    continue
+
+                im = crop_bbox_image(page, a["bbox"], OCR_DPI)
+                if im is None:
+                    continue
+
+                area_ratio = a["area_ratio"]
+                is_background_like = area_ratio > 0.85
+
+                # Mode "never": pas d'OCR
+                # Mode "smart": OCR seulement si l'image contient du texte
+                # Modes "always" et "conservative": OCR sur toutes les images (y compris plein-page)
+                do_img_ocr = False
+                if IMAGE_OCR_MODE == "never":
+                    do_img_ocr = False
+                elif IMAGE_OCR_MODE == "smart":
+                    do_img_ocr = _fast_has_text(im, OCR_LANGS, IMAGE_OCR_MIN_WORDS)
+                else:
+                    do_img_ocr = True
+
+                md_img = ""
+                txt, q = "", 0.0
+                if do_img_ocr:
+                    txt, q = _ocr_image_best(im, OCR_LANGS)
+
+                if txt and q >= OCR_TEXT_QUALITY_MIN:
+                    md_img = _classify_ocr_block(txt.strip())
+                else:
+                    if EMBED_IMAGES in ("all", "ocr_only"):
+                        im = _pil_resize_max(im, IMG_MAX_WIDTH)
+                        data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+                        md_img = f'![{IMG_ALT_PREFIX} – page {p+1}]({data_uri})'
+
+                if md_img:
+                    processed.append({
+                        "bbox": a["bbox"],
+                        "md": md_img,
+                        "kind": "image",
+                        "text_len": len(txt or ""),
+                        "area_ratio": area_ratio
+                    })
+
+            atoms = processed
+
+            # 3) Tri de lecture simple (haut → bas, gauche → droite)
+            def sort_key(a):
+                x0, y0, x1, y1 = a["bbox"]
+                y_center = 0.5 * (y0 + y1)
+                return (int(y_center / band_h), x0, y0)
+            atoms.sort(key=sort_key)
+
+            # 4) Concaténation lignes + wrap tableaux
+            page_buf: List[str] = []
+            para_buf: List[str] = []
+            last_band = None
+
+            def flush_para():
+                if not para_buf:
+                    return
+                block_txt = "\n".join(para_buf)
+                if _table_chars.search(block_txt):
+                    page_buf.append("```text"); page_buf.append(block_txt); page_buf.append("```")
+                else:
+                    page_buf.append(block_txt)
+                para_buf.clear()
+
+            for a in atoms:
+                x0, y0, x1, y1 = a["bbox"]
+                y_center = 0.5 * (y0 + y1)
+                band = int(y_center / band_h)
+                md = a["md"]
+                if last_band is not None and band != last_band:
+                    flush_para()
+                last_band = band
+                if a["kind"] == "text":
+                    para_buf.append(md)
+                else:
+                    flush_para()
+                    page_buf.append(md)
+            flush_para()
+
+            # Indicateur texte extrait sur la page (vectoriel ou OCR)
+            has_text_content = any(a["text_len"] > 0 for a in atoms)
+            # 5) Fallback OCR page : uniquement si aucun texte extrait et fallback activé
+            if not has_text_content and not OCR_DISABLE_PAGE_FALLBACK:
                 try:
-                    lv = int(style.split()[-1])
+                    best_txt, best_score = "", -1e9
+                    for d in OCR_DPI_CANDIDATES:
+                        im_page = _raster_pdf_page(page, d)
+                        txt, score = _ocr_image_best(im_page, OCR_LANGS)
+                        if score > best_score:
+                            best_txt, best_score = txt, score
+                        if best_score >= OCR_SCORE_GOOD_ENOUGH:
+                            break
+                    if best_txt.strip():
+                        page_buf.append("<!-- OCR page fallback -->")
+                        page_buf.append(_wrap_tables_as_code(best_txt.strip()))
                 except Exception:
-                    lv = 1
-                prefix = "#" * max(1, min(lv, 6)) + " "
-            elif "List" in style or "Bullet" in style or "Number" in style:
-                prefix = "- "
-            # runs (texte + images inline)
-            for run in para.runs:
-                if embed_images and run._element.xpath('.//w:drawing'):
-                    blips = run._element.xpath('.//a:blip', namespaces={'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
-                    if blips:
-                        rId = blips[0].get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
-                        img_bytes = None
-                        if rId:
-                            part = d.part.related_parts.get(rId)
-                            if part and hasattr(part, 'blob'):
-                                img_bytes = part.blob
-                        if img_bytes is None and image_data_map:
-                            img_bytes = next(iter(image_data_map.values()))
-                        if img_bytes:
-                            im = Image.open(io.BytesIO(img_bytes))
-                            im = _pil_resize_max(im, IMG_MAX_WIDTH)
-                            data_uri = _pil_to_data_uri(im, IMG_FORMAT, IMG_JPEG_QUALITY)
-                            text_parts.append(f"![{IMG_ALT_PREFIX}]({data_uri})")
-                            if add_ocr_text:
-                                ocr = get_ocr_basic(lang)
-                                res = ocr.ocr(np.array(im), cls=False) or []
-                                lines_ocr = []
-                                for item in res:
-                                    if isinstance(item, list):
-                                        for line in item:
-                                            if isinstance(line, list) and len(line) > 1:
-                                                lines_ocr.append(line[1][0])
-                                if lines_ocr:
-                                    text_parts.append("\n" + "\n".join(lines_ocr))
-                text_parts.append(fmt_run(run))
-            text = (prefix + "".join(text_parts)).strip()
-            if text:
-                out.append(text)
-    return _md_cleanup("\n\n".join(out))
+                    pass
 
-# ===========================
-# Route UI simple (inchangée)
-# ===========================
-HTML = r"""<!doctype html>
+            if page_buf:
+                md_lines.append("\n\n".join(page_buf))
+
+        final_md = "\n\n".join([l for l in md_lines if l.strip()]).strip()
+        return (final_md, meta)
+    finally:
+        doc.close()
+
+# ---------------------------
+# UI web (exactement comme ton origine, avec sliders .switch)
+# ---------------------------
+HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Doc → Markdown</title>
-<style>
-body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;padding:24px;background:#0b0f14;color:#e6edf3}
-.card{max-width:980px;margin:0 auto;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:16px}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-label{opacity:.9}
-input[type=file]{display:none}
-.drop{border:1px dashed rgba(255,255,255,.2);padding:16px;border-radius:12px;text-align:center;margin:8px 0;cursor:pointer}
-select,input[type=text]{background:#0e141b;color:#e6edf3;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:6px 8px}
-button{background:#63b3ff;color:#0b0f14;border:none;border-radius:8px;padding:8px 12px;cursor:pointer}
-textarea{width:100%;min-height:260px;background:#0e141b;color:#e6edf3;border-radius:8px;border:1px solid rgba(255,255,255,.1);padding:8px}
-.small{opacity:.7}
-.switch{position:relative;display:inline-block;width:40px;height:20px}
-.switch input{opacity:0;width:0;height:0}
-.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:rgba(255,255,255,.15);border-radius:20px;transition:.2s}
-.slider:before{position:absolute;content:"";height:14px;width:14px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
-input:checked + .slider{background:#63b3ff}
-input:checked + .slider:before{transform:translateX(20px)}
-</style>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>MarkItDown UI</title>
+  <style>
+    :root{
+      color-scheme: dark;
+      --bg: #0b0f14;
+      --bg2: #0e141b;
+      --card: rgba(255,255,255,0.06);
+      --card-border: rgba(255,255,255,0.08);
+      --text: #e6edf3;
+      --muted: #9fb0bf;
+      --accent: #63b3ff;
+      --accent-2: #8f7aff;
+      --ok: #58d68d;
+      --err: #ff6b6b;
+      --shadow: 0 6px 24px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.03);
+      --radius: 16px;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      color:var(--text);
+      background:
+        radial-gradient(1000px 600px at 20% -10%, #183a58 0%, transparent 60%),
+        radial-gradient(900px 500px at 120% 10%, #3b2d6a 0%, transparent 55%),
+        linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
+      background-attachment: fixed;
+      line-height:1.55;
+      padding:32px 20px 40px;
+    }
+    h1{margin:0 0 .35rem 0; font-size:1.65rem; letter-spacing:.2px}
+    .sub{color:var(--muted); font-size:.95rem; margin-bottom:18px}
+    .container{max-width:1060px; margin:0 auto}
+    .card{
+      background:var(--card);
+      border:1px solid var(--card-border);
+      border-radius:var(--radius);
+      box-shadow:var(--shadow);
+      padding:18px;
+      margin-top:16px;
+      backdrop-filter: blur(8px);
+    }
+    .row{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
+    label{font-weight:600}
+    input[type="text"], input[type="file"], textarea{
+      background:rgba(255,255,255,0.03);
+      color:var(--text);
+      border:1px solid rgba(255,255,255,0.12);
+      border-radius:12px;
+      padding:10px 12px;
+      outline:none;
+      transition:border .15s ease, box-shadow .15s ease;
+    }
+    input[type="text"]:focus, textarea:focus{
+      border-color:var(--accent);
+      box-shadow:0 0 0 3px rgba(99,179,255,.15);
+    }
+    textarea{
+      width:100%;
+      min-height:280px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size:.95rem;
+      resize: vertical;
+    }
+    button{
+      padding:10px 16px;
+      border-radius:12px;
+      border:1px solid rgba(255,255,255,0.12);
+      color:#0b0f14;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      cursor:pointer;
+      font-weight:700;
+      letter-spacing:.2px;
+      transition:transform .06s ease, filter .15s ease, opacity .2s ease;
+    }
+    button:hover{ filter:brightness(1.08) }
+    button:active{ transform:translateY(1px) }
+    button:disabled{ opacity:.55; cursor:not-allowed; filter:none }
+    .btn-ghost{
+      background:transparent;
+      color:var(--text);
+      border-color:rgba(255,255,255,0.16);
+    }
+    a#download{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:10px 16px; border-radius:12px;
+      border:1px solid rgba(255,255,255,0.16);
+      text-decoration:none; color:var(--text);
+      background:rgba(255,255,255,0.03);
+    }
+    .muted{color:var(--muted)}
+
+    /* Dropzone */
+    .drop{
+      border:1.5px dashed rgba(255,255,255,0.18);
+      border-radius:14px;
+      padding:18px;
+      text-align:center;
+      cursor:pointer;
+      transition:.15s border-color ease, background .15s ease;
+      background:rgba(255,255,255,0.02);
+    }
+    .drop:hover{border-color:rgba(255,255,255,0.35)}
+    .drop.active{border-color:var(--accent); background:rgba(99,179,255,.06)}
+
+    .filemeta{font-size:.95rem; color:var(--text); opacity:.9}
+
+    /* Switches (sliders) */
+    .switch{position:relative; display:inline-block; width:44px; height:24px}
+    .switch input{opacity:0; width:0; height:0}
+    .slider{
+      position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0;
+      background:rgba(255,255,255,0.12); transition:.2s; border-radius:999px; border:1px solid rgba(255,255,255,0.2);
+    }
+    .slider:before{
+      position:absolute; content:""; height:18px; width:18px; left:2px; top:2.5px;
+      background:white; transition:.2s; border-radius:50%;
+    }
+    .switch input:checked + .slider{
+      background:linear-gradient(135deg, var(--accent), var(--accent-2));
+      border-color:transparent;
+    }
+    .switch input:checked + .slider:before{ transform:translateX(20px) }
+
+    .progress{height:10px; background:rgba(255,255,255,0.08); border-radius:999px; overflow:hidden; display:none; margin-top:10px}
+    .bar{height:100%; width:40%; background:linear-gradient(135deg, var(--accent), var(--accent-2)); border-radius:999px; animation:slide 1.2s infinite}
+    @keyframes slide{0%{transform:translateX(-100%)}50%{transform:translateX(50%)}100%{transform:translateX(150%)}}
+
+    .stats{display:flex; gap:12px; align-items:center; margin-top:10px; flex-wrap:wrap}
+    .tag{
+      display:inline-flex; gap:6px; align-items:center;
+      background:rgba(255,255,255,0.05);
+      border:1px solid rgba(255,255,255,0.15);
+      border-radius:999px; padding:6px 10px; font-size:.9rem
+    }
+    .tag b{font-weight:800}
+  </style>
 </head>
 <body>
-<div class="card">
-  <h2>Conversion de documents en Markdown</h2>
-  <div class="row">
-    <label>Fichier :</label>
-    <input id="file" type="file">
-    <div id="meta" class="small"></div>
+  <div class="container">
+    <div class="card">
+      <h1>MarkItDown — Conversion</h1>
+      <div class="sub">Conversion Markdown + OCR et Base64</div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <label for="file">Fichier :</label>
+        <input id="file" type="file" />
+        <div class="filemeta" id="filemeta"></div>
+      </div>
+
+      <div class="drop" id="dropzone" tabindex="0" aria-label="Déposez un fichier ici">
+        Glissez-déposez votre fichier ici (ou utilisez le champ ci-dessus)
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <label for="plugins">Activer plugins MarkItDown</label>
+        <label class="switch">
+          <input id="plugins" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+
+        <label for="llm">Résumé Azure LLM</label>
+        <label class="switch">
+          <input id="llm" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+
+        <label for="forceocr">Forcer OCR</label>
+        <label class="switch">
+          <input id="forceocr" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="row" style="margin-top:12px; gap:8px; align-items:baseline;">
+        <label for="di">Endpoint Azure Document Intelligence</label>
+        <input id="di" type="text" placeholder="https://<resource>.cognitiveservices.azure.com/"/>
+        <span class="muted">Optionnel (MarkItDown)</span>
+      </div>
+
+      <div class="row" style="margin-top:12px; gap:10px">
+        <button id="convert">Convertir</button>
+        <a id="download" download="sortie.md" style="display:none">Télécharger Markdown</a>
+        <button id="copy" class="btn-ghost" title="Copier le Markdown">Copier</button>
+        <button id="clear" class="btn-ghost" title="Vider les zones">Vider</button>
+      </div>
+
+      <div class="stats">
+        <span class="tag">Durée: <b id="timer">0.00 s</b></span>
+        <span class="tag">Lignes MD: <b id="linecount">0</b></span>
+        <span class="tag">Caractères: <b id="charcount">0</b></span>
+        <span id="status" class="muted" style="margin-left:auto"></span>
+      </div>
+
+      <div class="progress" id="progress"><div class="bar"></div></div>
+    </div>
+
+    <div class="card">
+      <label>Markdown</label>
+      <textarea id="md" spellcheck="false"></textarea>
+    </div>
+
+    <div class="card">
+      <label>Métadonnées (JSON)</label>
+      <textarea id="meta" style="min-height:160px" spellcheck="false"></textarea>
+    </div>
   </div>
-  <div class="drop" id="drop">Glissez-déposez ici (ou cliquez)</div>
 
-  <div class="row">
-    <label>Activer plugins MarkItDown (texte uniquement)</label>
-    <label class="switch"><input id="mkd" type="checkbox" checked><span class="slider"></span></label>
-
-    <label>Forcer OCR + images (base64)</label>
-    <label class="switch"><input id="ocr" type="checkbox"><span class="slider"></span></label>
-
-    <label>Mode</label>
-    <select id="mode">
-      <option value="fast">Rapide (texte prioritaire)</option>
-      <option value="quality">Qualité (structure + images)</option>
-    </select>
-
-    <label>Langue OCR</label>
-    <input id="lang" type="text" placeholder="fra, eng, fra+eng" value="{DEFAULT_LANG}" style="width:140px">
-  </div>
-
-  <div class="row" style="margin-top:8px">
-    <button id="go">Convertir</button>
-    <button id="copy" type="button">Copier</button>
-    <a id="dl" style="display:none">Télécharger</a>
-    <div id="status" class="small"></div>
-  </div>
-
-  <div style="margin-top:8px">
-    <textarea id="md" placeholder="Le Markdown apparaîtra ici..."></textarea>
-  </div>
-</div>
 <script>
-const $=id=>document.getElementById(id);
-const drop=$("drop"), fi=$("file"), meta=$("meta");
-drop.onclick=()=>fi.click();
-drop.ondragover=e=>{e.preventDefault();drop.style.background="rgba(255,255,255,.06)";}
-drop.ondragleave=()=>drop.style.background="";
-drop.ondrop=e=>{e.preventDefault();drop.style.background=""; if(e.dataTransfer.files[0]) fi.files=e.dataTransfer.files; show();}
-fi.onchange=show;
-function show(){ if(!fi.files[0]){meta.textContent="";return;} const f=fi.files[0]; const s=f.size<1024?f.size+" B":(f.size<1048576?(f.size/1024).toFixed(1)+" KB":(f.size/1048576).toFixed(1)+" MB"); meta.textContent=f.name+" — "+s; }
+const $ = (id) => document.getElementById(id);
+const endpoint = "/convert";
 
-$("copy").onclick=async()=>{ try{ await navigator.clipboard.writeText($("md").value||""); $("status").textContent="Copié !"; setTimeout(()=>$("status").textContent="",1000);}catch{} };
+// drag & drop + meta
+(function(){
+  const dz = $("dropzone"), fi = $("file"), fm = $("filemeta");
+  function prettySize(bytes){ if(bytes < 1024) return bytes + " B"; if(bytes < 1048576) return (bytes/1024).toFixed(1) + " KB"; return (bytes/1048576).toFixed(1) + " MB"; }
+  function showMeta(f){ fm.textContent = f ? `${f.name} — ${prettySize(f.size)}` : ""; }
+  dz.addEventListener("click", () => fi.click());
+  dz.addEventListener("dragover", e => { e.preventDefault(); dz.classList.add("active"); });
+  dz.addEventListener("dragleave", () => dz.classList.remove("active"));
+  dz.addEventListener("drop", e => { e.preventDefault(); dz.classList.remove("active"); if(e.dataTransfer.files && e.dataTransfer.files[0]){ fi.files = e.dataTransfer.files; showMeta(fi.files[0]); } });
+  fi.addEventListener("change", () => showMeta(fi.files[0]));
+})();
 
-$("go").onclick=async()=>{
-  const f=fi.files[0]; if(!f){alert("Choisis un fichier");return;}
-  $("status").textContent="Conversion en cours...";
-  const fd=new FormData();
-  fd.append("file",f);
-  fd.append("activer_plugin_markitdown", $("mkd").checked ? "true":"false");
-  fd.append("forcer_ocr", $("ocr").checked ? "true":"false");
-  fd.append("mode", $("mode").value);
-  fd.append("lang", $("lang").value||"");
-  const res=await fetch("/convert",{method:"POST",body:fd});
-  if(!res.ok){ $("md").value="ERREUR: "+res.status+" "+(await res.text()); $("status").textContent=""; return;}
-  const text=await res.text();
-  $("md").value=text||"";
-  const a=$("dl");
-  a.href=URL.createObjectURL(new Blob([text],{type:"text/markdown;charset=utf-8"}));
-  a.download=(f.name.replace(/\.[^.]+$/,"")||"sortie")+".md";
-  a.textContent="Télécharger";
-  a.style.display="inline-block";
-  $("status").textContent="OK";
+// Timer + counters
+let timerId = null, t0 = 0;
+function startTimer(){ stopTimer(); t0 = performance.now(); timerId = setInterval(() => { const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); }, 100); }
+function stopTimer(final = false){ if(timerId){ clearInterval(timerId); timerId = null; } if(final){ const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); } }
+function updateCounters(){ const txt = $("md").value || ""; $("charcount").textContent = txt.length.toString(); $("linecount").textContent = (txt ? txt.split(/\r?\n/).length : 0).toString(); }
+$("copy").onclick = async () => { 
+  try { 
+    await navigator.clipboard.writeText($("md").value || ""); 
+    $("status").textContent = "Markdown copié"; 
+    setTimeout(() => { $("status").textContent = ""; }, 1200); 
+  } catch { 
+    $("status").textContent = "Impossible de copier."; 
+  } 
 };
+
+$("clear").onclick = () => { 
+  $("md").value = ""; 
+  $("meta").value = ""; 
+  $("download").style.display = "none"; 
+  updateCounters(); 
+  $("status").textContent = "Zones effacées."; 
+  setTimeout(() => { $("status").textContent = ""; }, 1200); 
+};
+
+// Convertir le document
+$("convert").onclick = async () => {
+  const f = $("file").files[0];
+  if(!f){ alert("Choisissez un fichier."); return; }
+  $("convert").disabled = true;
+  $("status").textContent = "Conversion en cours...";
+  $("md").value = "";
+  $("meta").value = "";
+  $("download").style.display = "none";
+  $("progress").style.display = "block";
+  startTimer();
+
+  const fd = new FormData();
+  fd.append("file", f);
+  fd.append("use_plugins", $("plugins").checked ? "true" : "false");
+  fd.append("use_llm", $("llm").checked ? "true" : "false");
+  fd.append("docintel_endpoint", $("di").value || "");
+  fd.append("force_ocr", $("forceocr").checked ? "true" : "false");
+
+  try {
+    const res = await fetch(endpoint, { method: "POST", body: fd });
+    if(!res.ok){ throw new Error("HTTP " + res.status); }
+    const json = await res.json();
+    $("md").value = json.markdown || "";
+    $("meta").value = JSON.stringify(json.metadata || {}, null, 2);
+    updateCounters();
+
+    const blob = new Blob([$("md").value], { type: "text/markdown;charset=utf-8" });
+    const url  = URL.createObjectURL(blob);
+    const a = $("download");
+    a.href = url;
+    a.download = (json.output_filename || "sortie.md");
+    a.style.display = "inline-flex";
+    $("status").textContent = "OK";
+  } catch(e) {
+    $("status").textContent = "Erreur : " + (e && e.message ? e.message : e);
+  } finally {
+    $("convert").disabled = false;
+    $("progress").style.display = "none";
+    stopTimer(true);
+  }
+};
+
+$("md").addEventListener("input", updateCounters);
 </script>
-</body></html>
-""".replace("{DEFAULT_LANG}", DEFAULT_OCR_LANGS)
+</body>
+</html>
+'''
 
 @app.get("/", response_class=HTMLResponse)
-def ui():
-    return HTMLResponse(HTML)
+def index():
+    return HTMLResponse(HTML_PAGE)
 
-# ===========================
-# Point d'entrée /convert
-# ===========================
-@app.post("/convert", response_class=PlainTextResponse)
+@app.get("/config", response_class=JSONResponse)
+def get_config():
+    return JSONResponse({"docintel_default": DEFAULT_DOCINTEL_ENDPOINT})
+
+# ---------------------------
+# Endpoint API de conversion
+# ---------------------------
+@app.post("/convert")
 async def convert(
     file: UploadFile = File(...),
-    activer_plugin_markitdown: bool = Form(True),
-    forcer_ocr: bool = Form(False),
-    mode: str = Form("fast"),  # "fast" | "quality"
-    lang: Optional[str] = Form(None)
+    use_plugins: bool = Form(False),
+    docintel_endpoint: Optional[str] = Form(None),
+    llm_model: Optional[str] = Form(None),   # ignoré pour Azure; gardé pour compat
+    use_llm: bool = Form(False),
+    force_ocr: bool = Form(False),
 ):
     """
-    - activer_plugin_markitdown=True  -> texte uniquement (si OCR OFF), sinon texte + OCR captures + images base64
-    - forcer_ocr=True                 -> OCR activé + images base64 + texte OCR sous les captures
-    - mode: fast (texte prioritaire), quality (structure + images)
-    - lang: fra | eng | fra+eng ...
-    Retour: Markdown (text/plain)
+    - Plugins OFF : MarkItDown simple (+ cleanup).
+    - Plugins ON (PDF + OCR forcé) : PyMuPDF inline → texte vectoriel + OCR “smart” des captures, fallback page si pas de texte, Markdown nettoyé.
+    - Image seule : OCR + base64 si OCR pauvre.
     """
-    if not file or not file.filename:
-        raise HTTPException(status_code=400, detail="Fichier manquant")
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Fichier vide")
-
-    # Sauvegarde upload si demandé
-    if SAVE_UPLOADS:
-        _save_if_needed(os.path.join(UPLOAD_DIR, file.filename), content)
-
-    ext = _guess_ext(file.filename)
-    lang_code = _determine_lang_code(lang)
-
     try:
-        # ==========
-        # PDF
-        # ==========
-        if ext == "pdf":
-            if activer_plugin_markitdown and not forcer_ocr:
-                # Texte uniquement
-                md = pdf_text_only_md(content)
-            elif forcer_ocr:
-                # OCR + images + texte OCR (captures) — qualité ou rapide
-                if mode == "quality":
-                    md = pdf_quality_with_ocr(content, lang_code)
-                else:
-                    # rapide : priorité texte, sinon OCR texte (pas d’images)
-                    md = pdf_fast_ocr_text(content, lang_code)
-            else:
-                # MarkItDown si dispo (texte propre), sinon texte PyMuPDF
-                if MarkItDown:
-                    md_engine = MarkItDown()
-                    res = md_engine.convert_stream(io.BytesIO(content), file_name=file.filename)
-                    md = _md_cleanup(getattr(res, "text_content", "") or "")
-                else:
-                    md = pdf_text_only_md(content)
+        t_start = time.perf_counter()
 
-        # ==========
-        # DOCX
-        # ==========
-        elif ext in ("docx", "doc"):
-            if ext == "doc":
-                raise HTTPException(status_code=400, detail=".doc non supporté (convertis en .docx)")
-            if activer_plugin_markitdown and not forcer_ocr:
-                # texte uniquement
-                md = docx_text_only_md(content)
-            elif forcer_ocr:
-                # images base64 + OCR sous l'image (mode qualité/rapide agit peu ici)
-                md = docx_with_images_and_ocr(
-                    content,
-                    lang=lang_code,
-                    embed_images=True,
-                    add_ocr_text=True
-                )
-            else:
-                # MarkItDown si dispo
-                if MarkItDown:
-                    md_engine = MarkItDown()
-                    res = md_engine.convert_stream(io.BytesIO(content), file_name=file.filename)
-                    md = _md_cleanup(getattr(res, "text_content", "") or "")
-                else:
-                    md = docx_text_only_md(content)
+        if not docintel_endpoint:
+            docintel_endpoint = DEFAULT_DOCINTEL_ENDPOINT
 
-        # ==========
-        # CSV / XLSX / XLS
-        # ==========
-        elif ext in ("csv", "xlsx", "xls"):
-            md = xlsx_csv_text_only_md(content, ext)
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Fichier vide")
 
-        # ==========
-        # Images (png/jpg...) -> OCR si forcer_ocr, sinon image embed
-        # ==========
-        elif ext in ("png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp"):
-            im = Image.open(io.BytesIO(content)).convert("RGB")
-            if forcer_ocr:
-                ocr = get_ocr_basic(lang_code)
-                res = ocr.ocr(np.array(im), cls=False) or []
-                lines = []
-                for item in res:
-                    if isinstance(item, list):
-                        for line in item:
-                            if isinstance(line, list) and len(line) > 1:
-                                lines.append(line[1][0])
-                text_md = "\n".join(lines) if lines else ""
-                # Intégrer aussi l'image (quality) selon préférence
-                im = _pil_resize_max(im, IMG_MAX_WIDTH)
-                data_uri = _pil_to_data_uri(im, IMG_FORMAT, IMG_JPEG_QUALITY)
-                if lines:
-                    md = f"![{IMG_ALT_PREFIX}]({data_uri})\n\n{text_md}"
-                else:
-                    md = f"![{IMG_ALT_PREFIX}]({data_uri})"
-            else:
-                # plugin texte uniquement => on n'intègre pas d'image si explicitement texte-only
-                if activer_plugin_markitdown:
-                    md = ""  # image seule = pas de texte
-                else:
-                    im = _pil_resize_max(im, IMG_MAX_WIDTH)
-                    data_uri = _pil_to_data_uri(im, IMG_FORMAT, IMG_JPEG_QUALITY)
-                    md = f"![{IMG_ALT_PREFIX}]({data_uri})"
+        # Sauvegarde du fichier source si demandé
+        in_path = None
+        if SAVE_UPLOADS:
+            in_path = os.path.join(UPLOAD_DIR, file.filename)
+            with open(in_path, "wb") as f:
+                f.write(content)
+
+        is_pdf = guess_is_pdf(file.filename, file.content_type)
+        is_img = guess_is_image(file.filename, file.content_type)
+
+        metadata: Dict[str, Any] = {}
+
+        if is_pdf and use_plugins and OCR_ENABLED and force_ocr:
+            # Pipeline PDF inline : texte + images (OCR “smart”) in‑place
+            markdown, meta_pdf = render_pdf_markdown_inline(content)
+            metadata.update(meta_pdf)
+            # Nettoyage du Markdown final
+            markdown = _md_cleanup(markdown)
 
         else:
-            raise HTTPException(status_code=400, detail=f"Type non supporté: .{ext}")
+            # Conversion MarkItDown générique
+            md_engine = MarkItDown(enable_plugins=use_plugins, docintel_endpoint=docintel_endpoint)
+            result = md_engine.convert_stream(io.BytesIO(content), file_name=file.filename)
+
+            markdown = getattr(result, "text_content", "") or ""
+            metadata.update(getattr(result, "metadata", {}) or {})
+            warnings = getattr(result, "warnings", None)
+            if warnings:
+                metadata["warnings"] = warnings
+
+            # Post-traitement Markdown
+            markdown = _md_cleanup(markdown)
+
+            # Image isolée + OCR local
+            if OCR_ENABLED and is_img:
+                ocr_text, score = ocr_image_bytes(content, OCR_LANGS)
+                if ocr_text.strip():
+                    markdown += "\n\n# OCR (extrait)\n" + ocr_text
+                if EMBED_IMAGES in ("all", "ocr_only") and (not ocr_text or score < OCR_TEXT_QUALITY_MIN):
+                    try:
+                        with Image.open(io.BytesIO(content)) as im:
+                            im = _pil_resize_max(im, IMG_MAX_WIDTH)
+                            data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+                            markdown += f'\n\n![{IMG_ALT_PREFIX}]({data_uri})\n'
+                    except Exception:
+                        pass
+
+        # Sauvegarde du résultat Markdown si demandé
+        out_name = f"{os.path.splitext(file.filename)[0]}.md"
+        out_path = None
+        if SAVE_OUTPUTS:
+            out_path = os.path.join(OUTPUT_DIR, out_name)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(markdown)
+
+        # Résumé Azure OpenAI (optionnel)
+        if use_llm:
+            client = get_azure_client()
+            if client:
+                try:
+                    snippet = markdown[:12000] if markdown else "[document vide]"
+                    resp = client.chat.completions.create(
+                        model=AZURE_DEPLOYMENT,
+                        messages=[
+                            {"role": "system", "content": "Tu es un assistant qui résume des documents techniques en français, de manière concise et structurée."},
+                            {"role": "user", "content": f"Résume le document suivant en 10 points maximum, avec un titre en H1 et des sous-titres:\n\n{snippet}"}
+                        ],
+                        max_completion_tokens=800
+                    )
+                    content_msg = None
+                    if resp and getattr(resp, "choices", None):
+                        msg = resp.choices[0].message
+                        if hasattr(msg, "content") and isinstance(msg.content, str):
+                            content_msg = msg.content
+                        elif hasattr(msg, "content") and isinstance(msg.content, list):
+                            parts = []
+                            for part in msg.content:
+                                if isinstance(part, dict) and "text" in part:
+                                    parts.append(part["text"])
+                            content_msg = "".join(parts) if parts else None
+                    metadata["azure_summary"] = content_msg or "[Résumé vide (vérifie le déploiement et le contenu)]"
+                except Exception as e:
+                    metadata["azure_summary"] = f"[Erreur Azure OpenAI: {type(e).__name__}: {e}]"
+            else:
+                metadata["azure_summary"] = "[Azure OpenAI non configuré]"
+
+        # Durée de traitement côté serveur
+        metadata["duration_sec"] = round(time.perf_counter() - t_start, 3)
+
+        if SAVE_UPLOADS and in_path:
+            metadata["saved_input_path"] = in_path
+        if SAVE_OUTPUTS and out_path:
+            metadata["saved_output_path"] = out_path
+
+        return JSONResponse({
+            "filename": file.filename,
+            "output_filename": out_name if SAVE_OUTPUTS else None,
+            "markdown": markdown,
+            "metadata": metadata,
+        })
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur de conversion: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Conversion error: {type(e).__name__}: {e}")
 
-    md = _md_cleanup(md or "")
-
-    # Sauvegarde output si demandé
-    if SAVE_OUTPUTS:
-        out_name = os.path.splitext(file.filename)[0] + ".md"
-        _save_if_needed(os.path.join(OUTPUT_DIR, out_name), md.encode("utf-8"))
-
-    return PlainTextResponse(md)
+# ---------------------------
+# Healthcheck
+# ---------------------------
+@app.get("/health", response_class=PlainTextResponse)
+def health():
+    return "ok"
