@@ -33,7 +33,6 @@ ALLOWED_MODES = {"fast", "quality"}
 # OCR (PaddleOCR)
 OCR_ENABLED        = os.getenv("OCR_ENABLED", "true").lower() == "true"
 _OCR_LANG_RAW      = os.getenv("OCR_LANGS", "fra+eng").strip().lower()
-OCR_LANG           = "fr" if "fra" in _OCR_LANG_RAW else "en"
 
 # PDF raster
 OCR_DPI            = int(os.getenv("OCR_DPI", "350"))
@@ -63,7 +62,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="4.1-paddleocr+modes-noazure")
+app = FastAPI(title="MarkItDown API", version="4.2-paddleocr-multilang+modes-noazure")
 
 app.add_middleware(
     CORSMiddleware,
@@ -92,11 +91,11 @@ def _md_cleanup(md: str) -> str:
     lines = []
     for L in md.replace("\r", "").split("\n"):
         l = re.sub(r"[ \t]+$", "", L)
-        l = re.sub(r"^\s*[•·●◦▪]\s+", "- ", l)
-        l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)
+        l = re.sub(r"^\s*[•·●◦▪]\s+", "- ", l)          # bullets unicode -> '- '
+        l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)   # "1)" ou "1]" -> "1. "
         lines.append(l)
     txt = "\n".join(lines)
-    # Encadrer grilles ASCII
+    # Encadrer grilles ASCII dans ```text
     txt = re.sub(
         r"(?:^|\n)((?:[|+\-=_].*\n){2,})",
         lambda m: "```text\n" + m.group(1).strip() + "\n```",
@@ -119,8 +118,10 @@ def _classify_ocr_block(txt: str) -> str:
     t = (txt or "").strip()
     if not t:
         return ""
+    # Tables ASCII -> bloc code text
     if re.search(r"^\s*\+.*[-+].*\+\s*$", t, flags=re.M) or re.search(r"^\s*\|.*\|\s*$", t, flags=re.M):
         return f"```text\n{t}\n```"
+    # Consoles/SQL -> bloc code
     if re.search(r"^\s*(\$|#)\s", t, flags=re.M) or "mysql>" in t:
         if re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|SHOW|GRANT|CHANGE\s+MASTER|START\s+(SLAVE|REPLICA))\b", t, flags=re.I):
             return f"```sql\n{t}\n```"
@@ -138,58 +139,100 @@ def _ocr_quality_score(txt: str) -> float:
     words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{3,12}", t)
     return max(0.0, min(1.0, 0.5 * alnum_ratio + 0.5 * min(1.0, n/600) + 0.02 * len(words)))
 
-def _build_paddle(mode: str) -> PaddleOCR:
+def _parse_langs(raw: str) -> List[str]:
+    parts = [p for p in re.split(r"[+,/|\s]+", raw) if p]
+    out: List[str] = []
+    for p in parts:
+        p = p.lower()
+        if p in ("fra", "fr"): out.append("fr")
+        elif p in ("eng", "en"): out.append("en")
+        elif p in ("deu", "ger", "german"): out.append("german")
+        elif p in ("spa", "es", "spanish"): out.append("latin")  # couvre l'espagnol et + via latin
+        else: out.append(p)
+    # unicité tout en gardant l'ordre
+    seen=set(); unique=[]
+    for l in out:
+        if l not in seen:
+            unique.append(l); seen.add(l)
+    # fallback large
+    if "latin" not in seen:
+        unique.append("latin")
+    return unique
+
+OCR_LANGS_LIST = _parse_langs(_OCR_LANG_RAW)
+
+def _paddle_key(mode: str, lang: str) -> str:
+    return f"{mode}:{lang}"
+
+def _build_paddle(mode: str, lang: str) -> PaddleOCR:
     # Version compatible: pas d'arguments 'det', 'rec', etc.
     return PaddleOCR(
         use_angle_cls=(mode == "quality"),
-        lang=OCR_LANG,
+        lang=lang,
         show_log=False,
     )
 
 _PADDLE_INSTANCES: Dict[str, PaddleOCR] = {}
 
-def _get_ocr(mode: str) -> PaddleOCR:
-    if mode not in _PADDLE_INSTANCES:
-        _PADDLE_INSTANCES[mode] = _build_paddle(mode)
-    return _PADDLE_INSTANCES[mode]
+def _get_ocr(mode: str, lang: str) -> PaddleOCR:
+    key = _paddle_key(mode, lang)
+    if key not in _PADDLE_INSTANCES:
+        _PADDLE_INSTANCES[key] = _build_paddle(mode, lang)
+    return _PADDLE_INSTANCES[key]
 
-def _paddle_ocr_text(im: Image.Image, mode: str) -> Tuple[str, float]:
+def _paddle_ocr_text_best(im: Image.Image, mode: str, langs: Optional[List[str]] = None) -> Tuple[str, float, str]:
+    """
+    Essaie plusieurs langues, retourne (texte, score, langue_utilisée).
+    S'arrête dès qu'on dépasse OCR_SCORE_GOOD_ENOUGH.
+    """
     if im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
     if mode == "quality":
         im = _preprocess_for_ocr(im)
-    ocr = _get_ocr(mode)
     img_nd = np.array(im)  # PIL -> numpy
-    # Appel compatible: uniquement cls=...
-    res = ocr.ocr(img_nd, cls=(mode == "quality"))
 
-    lines = []
-    if res and isinstance(res, list):
-        for page in res:
-            if not page:
-                continue
-            for det in page:
-                try:
-                    txt = det[1][0]
-                    if txt:
-                        lines.append(txt)
-                except Exception:
-                    continue
-    text = "\n".join(lines).strip()
-    return text, _ocr_quality_score(text)
+    candidates = langs or OCR_LANGS_LIST
+    best_txt, best_score, best_lang = "", -1e9, (candidates[0] if candidates else "en")
+
+    for lang in candidates:
+        try:
+            ocr = _get_ocr(mode, lang)
+            res = ocr.ocr(img_nd, cls=(mode == "quality"))
+            lines = []
+            if res and isinstance(res, list):
+                for page in res:
+                    if not page:
+                        continue
+                    for det in page:
+                        try:
+                            txt = det[1][0]
+                            if txt:
+                                lines.append(txt)
+                        except Exception:
+                            continue
+            text = "\n".join(lines).strip()
+            score = _ocr_quality_score(text)
+            if score > best_score:
+                best_txt, best_score, best_lang = text, score, lang
+            if best_score >= OCR_SCORE_GOOD_ENOUGH:
+                break
+        except Exception:
+            continue
+
+    return best_txt, best_score, best_lang
 
 def _fast_has_text_with_paddle(im: Image.Image, mode: str, min_words: int) -> bool:
     try:
-        txt, _ = _paddle_ocr_text(im, mode)
+        txt, _, _ = _paddle_ocr_text_best(im, mode)
         words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{2,}", txt)
         return len(words) >= min_words
     except Exception:
         return False
 
-def ocr_image_bytes(img_bytes: bytes, mode: str) -> Tuple[str, float]:
+def ocr_image_bytes(img_bytes: bytes, mode: str) -> Tuple[str, float, str]:
     with Image.open(io.BytesIO(img_bytes)) as im:
-        txt, score = _paddle_ocr_text(im, mode)
-        return _classify_ocr_block(txt), score
+        txt, score, used_lang = _paddle_ocr_text_best(im, mode)
+        return _classify_ocr_block(txt), score, used_lang
 
 def _raster_pdf_page(page: fitz.Page, dpi: int) -> Image.Image:
     scale = dpi / 72.0
@@ -339,7 +382,7 @@ def render_pdf_markdown_inline(
                 y0 = max(0.0, min(y0, page_h)); y1 = max(0.0, min(y1, page_h))
                 bbox = (x0, y0, x1, y1)
 
-                if btype == 0:  # texte
+                if btype == 0:  # bloc texte
                     for line in b.get("lines", []):
                         spans = line.get("spans", [])
                         if not spans:
@@ -361,7 +404,7 @@ def render_pdf_markdown_inline(
                             "area_ratio": ((lx1 - lx0) * (ly1 - ly0)) / page_area
                         })
 
-                elif btype == 1:  # image
+                elif btype == 1:  # bloc image
                     atoms.append({
                         "bbox": bbox,
                         "md": None,
@@ -392,10 +435,12 @@ def render_pdf_markdown_inline(
                         do_img_ocr = True
 
                 md_img = ""
-                txt, q = "", 0.0
+                txt, q, used_lang = "", 0.0, None
                 if do_img_ocr and OCR_ENABLED:
                     try:
-                        txt, q = _paddle_ocr_text(im, mode)
+                        txt, q, used_lang = _paddle_ocr_text_best(im, mode)
+                        if used_lang:
+                            meta_out.setdefault("ocr_used_langs", set()).add(used_lang)
                     except Exception as e:
                         meta_out.setdefault("ocr_errors", []).append(
                             f"img_page_{p+1}: {type(e).__name__}: {e}"
@@ -423,14 +468,14 @@ def render_pdf_markdown_inline(
 
             atoms = processed
 
-            # 3) Tri de lecture
+            # 3) Tri de lecture simple (haut → bas, gauche → droite)
             def sort_key(a):
                 x0, y0, x1, y1 = a["bbox"]
                 y_center = 0.5 * (y0 + y1)
                 return (int(y_center / band_h), x0, y0)
             atoms.sort(key=sort_key)
 
-            # 4) Concaténation & wrap tableaux
+            # 4) Concaténation lignes + wrap tableaux
             page_buf: List[str] = []
             para_buf: List[str] = []
             last_band = None
@@ -464,10 +509,12 @@ def render_pdf_markdown_inline(
             has_text_content = any(a["text_len"] > 0 for a in atoms)
             if not has_text_content and not OCR_DISABLE_PAGE_FALLBACK and OCR_ENABLED:
                 try:
-                    best_txt, best_score = "", -1e9
+                    best_txt, best_score, used_lang = "", -1e9, None
                     for d in dpi_candidates:
                         im_page = _raster_pdf_page(page, d)
-                        txt, score = _paddle_ocr_text(im_page, mode)
+                        txt, score, lang = _paddle_ocr_text_best(im_page, mode)
+                        if lang:
+                            meta_out.setdefault("ocr_used_langs", set()).add(lang)
                         if score > best_score:
                             best_txt, best_score = txt, score
                         if best_score >= OCR_SCORE_GOOD_ENOUGH:
@@ -484,12 +531,17 @@ def render_pdf_markdown_inline(
                 md_lines.append("\n\n".join(page_buf))
 
         final_md = "\n\n".join([l for l in md_lines if l.strip()]).strip()
+
+        # sérialiser l'ensemble des langues utilisées (set -> list)
+        if "ocr_used_langs" in meta_out and isinstance(meta_out["ocr_used_langs"], set):
+            meta_out["ocr_used_langs"] = sorted(list(meta_out["ocr_used_langs"]))
+
         return (final_md, meta)
     finally:
         doc.close()
 
 # ---------------------------
-# UI web (sans Azure/LLM)
+# UI web (sans Azure/LLM, inchangée visuellement)
 # ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
@@ -718,7 +770,7 @@ $("convert").onclick = async () => {
   fd.append("file", f);
   fd.append("use_plugins", $("plugins").checked ? "true" : "false");
   fd.append("force_ocr", $("forceocr").checked ? "true" : "false");
-  // Pour surcharger le mode côté serveur, décommentez:
+  // Pour surcharger le mode côté serveur :
   // fd.append("mode", "fast");  // ou "quality"
 
   try {
@@ -799,6 +851,9 @@ async def convert(
             )
             metadata.update(meta_pdf)
             if ocr_meta:
+                # sérialise les sets éventuels
+                if isinstance(ocr_meta.get("ocr_used_langs"), set):
+                    ocr_meta["ocr_used_langs"] = sorted(list(ocr_meta["ocr_used_langs"]))
                 metadata.update(ocr_meta)
             markdown = _md_cleanup(markdown)
 
@@ -819,7 +874,11 @@ async def convert(
             # Image isolée + OCR local (Paddle) avec fallback silencieux
             if OCR_ENABLED and is_img:
                 try:
-                    ocr_text, score = ocr_image_bytes(content, selected_mode)
+                    ocr_text, score, used_lang = ocr_image_bytes(content, selected_mode)
+                    if used_lang:
+                        metadata.setdefault("ocr_used_langs", [])
+                        if used_lang not in metadata["ocr_used_langs"]:
+                            metadata["ocr_used_langs"].append(used_lang)
                     if ocr_text.strip():
                         markdown += "\n\n# OCR (extrait)\n" + ocr_text
                     if EMBED_IMAGES in ("all", "ocr_only") and (not ocr_text or score < OCR_TEXT_QUALITY_MIN):
