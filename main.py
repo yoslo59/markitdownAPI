@@ -3,6 +3,7 @@ import io
 import re
 import time
 import base64
+import traceback
 from typing import Optional, Tuple, List, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -29,17 +30,16 @@ OUTPUT_DIR    = os.getenv("OUTPUT_DIR", "/data/outputs")
 PROCESSING_MODE = os.getenv("PROCESSING_MODE", "quality").strip().lower()
 ALLOWED_MODES = {"fast", "quality"}
 
-# OCR (piloté par PaddleOCR)
+# OCR (PaddleOCR)
 OCR_ENABLED        = os.getenv("OCR_ENABLED", "true").lower() == "true"
-# OCR_LANGS initialement "fra+eng" → on choisit un modèle principal pour PaddleOCR
 _OCR_LANG_RAW      = os.getenv("OCR_LANGS", "fra+eng").strip().lower()
 OCR_LANG           = "fr" if "fra" in _OCR_LANG_RAW else "en"
 
-# Les DPI servent au raster PDF -> images (pas de PSM sous Paddle, variables conservées pour compat)
+# PDF raster
 OCR_DPI            = int(os.getenv("OCR_DPI", "350"))
 OCR_MAX_PAGES      = int(os.getenv("OCR_MAX_PAGES", "50"))
-OCR_MIN_CHARS      = int(os.getenv("OCR_MIN_CHARS", "500"))
-OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,4,3,11").split(",")]  # non utilisé par Paddle (compat)
+OCR_MIN_CHARS      = int(os.getenv("OCR_MIN_CHARS", "500"))  # compat
+OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,4,3,11").split(",")]  # compat (non utilisé)
 OCR_DPI_CANDIDATES = [int(x) for x in os.getenv("OCR_DPI_CANDIDATES", "300,350,400").split(",")]
 OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
 
@@ -63,7 +63,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="3.9-paddleocr+modes-noazure")
+app = FastAPI(title="MarkItDown API", version="4.0-paddleocr+modes-noazure")
 
 app.add_middleware(
     CORSMiddleware,
@@ -96,7 +96,7 @@ def _md_cleanup(md: str) -> str:
         l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)
         lines.append(l)
     txt = "\n".join(lines)
-    # Encadrer les grilles ASCII dans ```text
+    # Encadrer grilles ASCII
     txt = re.sub(
         r"(?:^|\n)((?:[|+\-=_].*\n){2,})",
         lambda m: "```text\n" + m.group(1).strip() + "\n```",
@@ -110,7 +110,6 @@ def _md_cleanup(md: str) -> str:
 _table_chars = re.compile(r"[|+\-=_]{3,}")
 
 def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
-    # prétraitement léger
     g = ImageOps.grayscale(im)
     g = ImageOps.autocontrast(g, cutoff=1)
     g = g.filter(ImageFilter.MedianFilter(size=3))
@@ -140,8 +139,6 @@ def _ocr_quality_score(txt: str) -> float:
     return max(0.0, min(1.0, 0.5 * alnum_ratio + 0.5 * min(1.0, n/600) + 0.02 * len(words)))
 
 def _build_paddle(mode: str) -> PaddleOCR:
-    # QUALITY: plus précis, rotation (angle_cls) activée
-    # FAST: plus rapide, angle_cls désactivé, batch plus grand
     if mode == "quality":
         return PaddleOCR(
             use_angle_cls=True,
@@ -169,33 +166,40 @@ def _get_ocr(mode: str) -> PaddleOCR:
     return _PADDLE_INSTANCES[mode]
 
 def _paddle_ocr_text(im: Image.Image, mode: str) -> Tuple[str, float]:
-    if im.mode not in ("RGB", "L"):
-        im = im.convert("RGB")
-    if mode == "quality":
-        im = _preprocess_for_ocr(im)
-    ocr = _get_ocr(mode)
-    img_nd = np.array(im)  # PIL -> numpy
-    res = ocr.ocr(img_nd)
+    try:
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        if mode == "quality":
+            im = _preprocess_for_ocr(im)
+        ocr = _get_ocr(mode)
+        img_nd = np.array(im)  # PIL -> numpy
+        res = ocr.ocr(img_nd)
 
-    lines = []
-    if res and isinstance(res, list):
-        for page in res:
-            if not page:
-                continue
-            for det in page:
-                try:
-                    txt = det[1][0]
-                    if txt:
-                        lines.append(txt)
-                except Exception:
+        lines = []
+        if res and isinstance(res, list):
+            for page in res:
+                if not page:
                     continue
-    text = "\n".join(lines).strip()
-    return text, _ocr_quality_score(text)
+                for det in page:
+                    try:
+                        txt = det[1][0]
+                        if txt:
+                            lines.append(txt)
+                    except Exception:
+                        continue
+        text = "\n".join(lines).strip()
+        return text, _ocr_quality_score(text)
+    except Exception:
+        # Laisse l'appelant gérer le fallback; remonte une exception détaillée
+        raise
 
 def _fast_has_text_with_paddle(im: Image.Image, mode: str, min_words: int) -> bool:
-    txt, _ = _paddle_ocr_text(im, mode)
-    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{2,}", txt)
-    return len(words) >= min_words
+    try:
+        txt, _ = _paddle_ocr_text(im, mode)
+        words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{2,}", txt)
+        return len(words) >= min_words
+    except Exception:
+        return False
 
 def ocr_image_bytes(img_bytes: bytes, mode: str) -> Tuple[str, float]:
     with Image.open(io.BytesIO(img_bytes)) as im:
@@ -244,7 +248,7 @@ def crop_bbox_image(page: fitz.Page, bbox: Tuple[float, float, float, float], dp
 # PDF inline : texte + images (OCR smart) + fallback
 # ---------------------------
 def _is_bold(flags: int) -> bool:
-    return bool(flags & 1 or flags & 32)  # BOLD | FAKEBOLD
+    return bool(flags & 1 or flags & 32)
 
 def _median_font_size(page_raw: Dict[str, Any]) -> float:
     sizes = []
@@ -310,8 +314,8 @@ def _wrap_tables_as_code(txt: str) -> str:
         out.extend(buf); out.append("```")
     return "\n".join(out)
 
-def render_pdf_markdown_inline(pdf_bytes: bytes, mode: str) -> Tuple[str, Dict[str, Any]]:
-    # Ajustements selon le mode
+def render_pdf_markdown_inline(pdf_bytes: bytes, mode: str, meta_out: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    # DPI/mode
     if mode == "fast":
         dpi_page = min(OCR_DPI, 300)
         dpi_candidates = [min(x, 300) for x in OCR_DPI_CANDIDATES[:2]]
@@ -376,14 +380,11 @@ def render_pdf_markdown_inline(pdf_bytes: bytes, mode: str) -> Tuple[str, Dict[s
                         "area_ratio": ((x1 - x0) * (y1 - y0)) / page_area
                     })
 
-            has_vector_text = any(a["kind"] == "text" for a in atoms)  # indicatif
-
             # 2) IMAGES -> OCR (Paddle) ou embed base64
             processed = []
             for a in atoms:
                 if a["kind"] != "image_raw":
-                    processed.append(a)
-                    continue
+                    processed.append(a); continue
 
                 im = crop_bbox_image(page, a["bbox"], dpi_page)
                 if im is None:
@@ -394,15 +395,18 @@ def render_pdf_markdown_inline(pdf_bytes: bytes, mode: str) -> Tuple[str, Dict[s
                     do_img_ocr = False
                 elif IMAGE_OCR_MODE == "smart":
                     do_img_ocr = _fast_has_text_with_paddle(im, mode, IMAGE_OCR_MIN_WORDS)
-                elif IMAGE_OCR_MODE in ("always", "conservative"):
-                    do_img_ocr = True
-                else:
+                else:  # always | conservative | autre
                     do_img_ocr = True
 
                 md_img = ""
                 txt, q = "", 0.0
-                if do_img_ocr:
-                    txt, q = _paddle_ocr_text(im, mode)
+                if do_img_ocr and OCR_ENABLED:
+                    try:
+                        txt, q = _paddle_ocr_text(im, mode)
+                    except Exception as e:
+                        meta_out.setdefault("ocr_errors", []).append(
+                            f"img_page_{p+1}: {type(e).__name__}: {e}"
+                        )
 
                 if txt and q >= OCR_TEXT_QUALITY_MIN:
                     md_img = _classify_ocr_block(txt.strip())
@@ -460,9 +464,8 @@ def render_pdf_markdown_inline(pdf_bytes: bytes, mode: str) -> Tuple[str, Dict[s
                     page_buf.append(md)
             flush_para()
 
-            has_text_content = any(a["text_len"] > 0 for a in atoms)
-
             # 5) Fallback OCR page si rien d’extrait
+            has_text_content = any(a["text_len"] > 0 for a in atoms)
             if not has_text_content and not OCR_DISABLE_PAGE_FALLBACK and OCR_ENABLED:
                 try:
                     best_txt, best_score = "", -1e9
@@ -476,8 +479,10 @@ def render_pdf_markdown_inline(pdf_bytes: bytes, mode: str) -> Tuple[str, Dict[s
                     if best_txt.strip():
                         page_buf.append("<!-- OCR page fallback -->")
                         page_buf.append(_wrap_tables_as_code(best_txt.strip()))
-                except Exception:
-                    pass
+                except Exception as e:
+                    meta_out.setdefault("ocr_errors", []).append(
+                        f"page_fallback_{p+1}: {type(e).__name__}: {e}"
+                    )
 
             if page_buf:
                 md_lines.append("\n\n".join(page_buf))
@@ -488,7 +493,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes, mode: str) -> Tuple[str, Dict[s
         doc.close()
 
 # ---------------------------
-# UI web (Azure DI/LLM supprimés)
+# UI web (sans Azure/DI)
 # ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
@@ -551,7 +556,7 @@ HTML_PAGE = r'''<!doctype html>
     }
     textarea{
       width:100%;
-      min-height:280px;
+      min_height:280px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
       font-size:.95rem;
       resize: vertical;
@@ -583,50 +588,21 @@ HTML_PAGE = r'''<!doctype html>
       background:rgba(255,255,255,0.03);
     }
     .muted{color:var(--muted)}
-
-    /* Dropzone */
-    .drop{
-      border:1.5px dashed rgba(255,255,255,0.18);
-      border-radius:14px;
-      padding:18px;
-      text-align:center;
-      cursor:pointer;
-      transition:.15s border-color ease, background .15s ease;
-      background:rgba(255,255,255,0.02);
-    }
+    .drop{border:1.5px dashed rgba(255,255,255,0.18); border-radius:14px; padding:18px; text-align:center; cursor:pointer; transition:.15s; background:rgba(255,255,255,0.02)}
     .drop:hover{border-color:rgba(255,255,255,0.35)}
     .drop.active{border-color:var(--accent); background:rgba(99,179,255,.06)}
-
     .filemeta{font-size:.95rem; color:var(--text); opacity:.9}
-
-    /* Switches (sliders) */
     .switch{position:relative; display:inline-block; width:44px; height:24px}
     .switch input{opacity:0; width:0; height:0}
-    .slider{
-      position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0;
-      background:rgba(255,255,255,0.12); transition:.2s; border-radius:999px; border:1px solid rgba(255,255,255,0.2);
-    }
-    .slider:before{
-      position:absolute; content:""; height:18px; width:18px; left:2px; top:2.5px;
-      background:white; transition:.2s; border-radius:50%;
-    }
-    .switch input:checked + .slider{
-      background:linear-gradient(135deg, var(--accent), var(--accent-2));
-      border-color:transparent;
-    }
+    .slider{position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background:rgba(255,255,255,0.12); transition:.2s; border-radius:999px; border:1px solid rgba(255,255,255,0.2)}
+    .slider:before{position:absolute; content:""; height:18px; width:18px; left:2px; top:2.5px; background:white; transition:.2s; border-radius:50%}
+    .switch input:checked + .slider{background:linear-gradient(135deg, var(--accent), var(--accent-2)); border-color:transparent}
     .switch input:checked + .slider:before{ transform:translateX(20px) }
-
     .progress{height:10px; background:rgba(255,255,255,0.08); border-radius:999px; overflow:hidden; display:none; margin-top:10px}
     .bar{height:100%; width:40%; background:linear-gradient(135deg, var(--accent), var(--accent-2)); border-radius:999px; animation:slide 1.2s infinite}
     @keyframes slide{0%{transform:translateX(-100%)}50%{transform:translateX(50%)}100%{transform:translateX(150%)}}
-
     .stats{display:flex; gap:12px; align-items:center; margin-top:10px; flex-wrap:wrap}
-    .tag{
-      display:inline-flex; gap:6px; align-items:center;
-      background:rgba(255,255,255,0.05);
-      border:1px solid rgba(255,255,255,0.15);
-      border-radius:999px; padding:6px 10px; font-size:.9rem
-    }
+    .tag{display:inline-flex; gap:6px; align-items:center; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); border-radius:999px; padding:6px 10px; font-size:.9rem}
     .tag b{font-weight:800}
   </style>
 </head>
@@ -694,7 +670,6 @@ HTML_PAGE = r'''<!doctype html>
 const $ = (id) => document.getElementById(id);
 const endpoint = "/convert";
 
-// drag & drop + meta
 (function(){
   const dz = $("dropzone"), fi = $("file"), fm = $("filemeta");
   function prettySize(bytes){ if(bytes < 1024) return bytes + " B"; if(bytes < 1048576) return (bytes/1024).toFixed(1) + " KB"; return (bytes/1048576).toFixed(1) + " MB"; }
@@ -706,7 +681,6 @@ const endpoint = "/convert";
   fi.addEventListener("change", () => showMeta(fi.files[0]));
 })();
 
-// Timer + counters
 let timerId = null, t0 = 0;
 function startTimer(){ stopTimer(); t0 = performance.now(); timerId = setInterval(() => { const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); }, 100); }
 function stopTimer(final = false){ if(timerId){ clearInterval(timerId); timerId = null; } if(final){ const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); } }
@@ -730,7 +704,6 @@ $("clear").onclick = () => {
   setTimeout(() => { $("status").textContent = ""; }, 1200); 
 };
 
-// Convertir le document
 $("convert").onclick = async () => {
   const f = $("file").files[0];
   if(!f){ alert("Choisissez un fichier."); return; }
@@ -746,8 +719,7 @@ $("convert").onclick = async () => {
   fd.append("file", f);
   fd.append("use_plugins", $("plugins").checked ? "true" : "false");
   fd.append("force_ocr", $("forceocr").checked ? "true" : "false");
-  // Pour surcharger le mode côté serveur:
-  // fd.append("mode", "fast");  // ou "quality"
+  // fd.append("mode", "fast"); // ou "quality" pour override
 
   try {
     const res = await fetch(endpoint, { method: "POST", body: fd });
@@ -755,14 +727,9 @@ $("convert").onclick = async () => {
     const json = await res.json();
     $("md").value = json.markdown || "";
     $("meta").value = JSON.stringify(json.metadata || {}, null, 2);
-    updateCounters();
-
     const blob = new Blob([$("md").value], { type: "text/markdown;charset=utf-8" });
-    const url  = URL.createObjectURL(blob);
-    const a = $("download");
-    a.href = url;
-    a.download = (json.output_filename || "sortie.md");
-    a.style.display = "inline-flex";
+    const url  = URL.createObjectURL(blob); const a = $("download");
+    a.href = url; a.download = (json.output_filename || "sortie.md"); a.style.display = "inline-flex";
     $("status").textContent = "OK";
   } catch(e) {
     $("status").textContent = "Erreur : " + (e && e.message ? e.message : e);
@@ -791,11 +758,12 @@ async def convert(
     file: UploadFile = File(...),
     use_plugins: bool = Form(False),
     force_ocr: bool = Form(False),
-    mode: Optional[str] = Form(None),  # "fast" | "quality" (optionnel; sinon PROCESSING_MODE)
+    mode: Optional[str] = Form(None),  # "fast" | "quality"
 ):
     """
     - Plugins OFF : MarkItDown simple (+ cleanup).
-    - Plugins ON + PDF : extraction inline (texte vectoriel) + OCR Paddle sur images, fallback page si pas de texte.
+    - Plugins ON + PDF + force_ocr : extraction inline (texte + OCR images, fallback page).
+    - Plugins ON + PDF sans force_ocr : MarkItDown plugins (sans OCR inline).
     - Image seule : OCR + base64 si OCR pauvre.
     - Modes : 'quality' (défaut) ou 'fast'.
     """
@@ -806,7 +774,7 @@ async def convert(
         if not content:
             raise HTTPException(status_code=400, detail="Fichier vide")
 
-        # Sauvegarde du fichier source si demandé
+        # Sauvegarde du fichier source
         in_path = None
         if SAVE_UPLOADS:
             in_path = os.path.join(UPLOAD_DIR, file.filename)
@@ -823,14 +791,17 @@ async def convert(
 
         metadata: Dict[str, Any] = {"processing_mode": selected_mode}
 
-        if is_pdf and use_plugins and OCR_ENABLED and (force_ocr or True):
-            # Pipeline PDF inline : texte + OCR images (+ fallback page)
-            markdown, meta_pdf = render_pdf_markdown_inline(content, selected_mode)
+        if is_pdf and use_plugins and OCR_ENABLED and force_ocr:
+            # ✅ Corrigé : on ne force plus OCR tout le temps
+            ocr_meta: Dict[str, Any] = {}
+            markdown, meta_pdf = render_pdf_markdown_inline(content, selected_mode, ocr_meta)
             metadata.update(meta_pdf)
+            if ocr_meta:
+                metadata.update(ocr_meta)
             markdown = _md_cleanup(markdown)
 
         else:
-            # Conversion MarkItDown générique
+            # Conversion MarkItDown générique (plugins selon l'UI)
             md_engine = MarkItDown(enable_plugins=use_plugins)
             result = md_engine.convert_stream(io.BytesIO(content), file_name=file.filename)
 
@@ -843,21 +814,30 @@ async def convert(
             # Nettoyage
             markdown = _md_cleanup(markdown)
 
-            # Image isolée + OCR local (Paddle)
+            # Image isolée + OCR local (Paddle) avec fallback silencieux
             if OCR_ENABLED and is_img:
-                ocr_text, score = ocr_image_bytes(content, selected_mode)
-                if ocr_text.strip():
-                    markdown += "\n\n# OCR (extrait)\n" + ocr_text
-                if EMBED_IMAGES in ("all", "ocr_only") and (not ocr_text or score < OCR_TEXT_QUALITY_MIN):
-                    try:
+                try:
+                    ocr_text, score = ocr_image_bytes(content, selected_mode)
+                    if ocr_text.strip():
+                        markdown += "\n\n# OCR (extrait)\n" + ocr_text
+                    if EMBED_IMAGES in ("all", "ocr_only") and (not ocr_text or score < OCR_TEXT_QUALITY_MIN):
                         with Image.open(io.BytesIO(content)) as im:
                             im = _pil_resize_max(im, IMG_MAX_WIDTH)
                             data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
                             markdown += f'\n\n![{IMG_ALT_PREFIX}]({data_uri})\n'
-                    except Exception:
-                        pass
+                except Exception as e:
+                    metadata.setdefault("ocr_errors", []).append(f"image: {type(e).__name__}: {e}")
+                    # Fallback : on embarque l'image si demandé
+                    if EMBED_IMAGES in ("all", "ocr_only"):
+                        try:
+                            with Image.open(io.BytesIO(content)) as im:
+                                im = _pil_resize_max(im, IMG_MAX_WIDTH)
+                                data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+                                markdown += f'\n\n![{IMG_ALT_PREFIX}]({data_uri})\n'
+                        except Exception:
+                            pass
 
-        # Sauvegarde du résultat Markdown si demandé
+        # Sauvegarde résultat
         out_name = f"{os.path.splitext(file.filename)[0]}.md"
         out_path = None
         if SAVE_OUTPUTS:
@@ -865,9 +845,8 @@ async def convert(
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(markdown)
 
-        # Durée de traitement côté serveur
+        # Durée
         metadata["duration_sec"] = round(time.perf_counter() - t_start, 3)
-
         if SAVE_UPLOADS and in_path:
             metadata["saved_input_path"] = in_path
         if SAVE_OUTPUTS and out_path:
@@ -883,7 +862,10 @@ async def convert(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Conversion error: {type(e).__name__}: {e}")
+        # remonte le détail côté client pour debug rapide
+        detail = f"Conversion error: {type(e).__name__}: {e}"
+        trace = traceback.format_exc(limit=3)
+        raise HTTPException(status_code=500, detail=f"{detail}\n{trace}")
 
 # ---------------------------
 # Healthcheck
