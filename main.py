@@ -363,7 +363,10 @@ def render_pdf_markdown_inline(
         total_pages = min(doc.page_count, OCR_MAX_PAGES)
         for p in range(total_pages):
             page = doc.load_page(p)
-            raw = page.get_text("rawdict") or {}
+
+            # ⬅️ ICI: utiliser "dict" (≠ rawdict)
+            raw = page.get_text("dict") or {}
+
             median_size = _median_font_size(raw)
             line_h_med = 12.0 if median_size == 0 else median_size * 1.0
             band_h = max(8.0, line_h_med * 1.2)
@@ -395,7 +398,11 @@ def render_pdf_markdown_inline(
 
                         md_line = _line_to_md(spans, median_size).strip()
                         if not md_line:
+                            # Fallback ultra sûr: concatène le texte brut des spans
+                            md_line = "".join(s.get("text", "") for s in spans).strip()
+                        if not md_line:
                             continue
+
                         atoms.append({
                             "bbox": line_bbox,
                             "md": md_line,
@@ -413,7 +420,7 @@ def render_pdf_markdown_inline(
                         "area_ratio": ((x1 - x0) * (y1 - y0)) / page_area
                     })
 
-            # 2) IMAGES -> OCR (Paddle) ou embed base64
+            # 2) IMAGES -> OCR (Paddle) ou embed base64 (même logique qu’avant)
             processed = []
             for a in atoms:
                 if a["kind"] != "image_raw":
@@ -423,7 +430,6 @@ def render_pdf_markdown_inline(
                 if im is None:
                     continue
 
-                # Décision d'OCR
                 if force_ocr_images:
                     do_img_ocr = True
                 else:
@@ -446,7 +452,6 @@ def render_pdf_markdown_inline(
                             f"img_page_{p+1}: {type(e).__name__}: {e}"
                         )
 
-                # Si on force l'OCR, on accepte du texte même un peu faible
                 accept_low_quality = force_ocr_images and txt and len(txt) >= 10
 
                 if (txt and q >= OCR_TEXT_QUALITY_MIN) or accept_low_quality:
@@ -468,14 +473,14 @@ def render_pdf_markdown_inline(
 
             atoms = processed
 
-            # 3) Tri de lecture simple (haut → bas, gauche → droite)
+            # 3) Tri de lecture
             def sort_key(a):
                 x0, y0, x1, y1 = a["bbox"]
                 y_center = 0.5 * (y0 + y1)
                 return (int(y_center / band_h), x0, y0)
             atoms.sort(key=sort_key)
 
-            # 4) Concaténation lignes + wrap tableaux
+            # 4) Concaténation
             page_buf: List[str] = []
             para_buf: List[str] = []
             last_band = None
@@ -505,8 +510,9 @@ def render_pdf_markdown_inline(
                     page_buf.append(md)
             flush_para()
 
-            # 5) Fallback OCR page si rien d’extrait
-            has_text_content = any(a["text_len"] > 0 for a in atoms)
+            # 5) Fallback OCR page (si aucun texte/ocr sur la page)
+            has_text_content = any(a["kind"] == "text" and a["text_len"] > 0 for a in atoms) \
+                               or any(a["kind"] == "image" and a["text_len"] > 0 for a in atoms)
             if not has_text_content and not OCR_DISABLE_PAGE_FALLBACK and OCR_ENABLED:
                 try:
                     best_txt, best_score, used_lang = "", -1e9, None
@@ -532,13 +538,13 @@ def render_pdf_markdown_inline(
 
         final_md = "\n\n".join([l for l in md_lines if l.strip()]).strip()
 
-        # sérialiser l'ensemble des langues utilisées (set -> list)
         if "ocr_used_langs" in meta_out and isinstance(meta_out["ocr_used_langs"], set):
             meta_out["ocr_used_langs"] = sorted(list(meta_out["ocr_used_langs"]))
 
         return (final_md, meta)
     finally:
         doc.close()
+
 
 # ---------------------------
 # UI web (sans Azure/LLM, inchangée visuellement)
