@@ -10,10 +10,9 @@ from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from markitdown import MarkItDown
-from openai import AzureOpenAI
 
-# OCR libs
-import pytesseract
+# OCR & Images
+from paddleocr import PaddleOCR
 from PIL import Image, ImageOps, ImageFilter
 import fitz  # PyMuPDF
 
@@ -25,20 +24,23 @@ SAVE_OUTPUTS  = os.getenv("SAVE_OUTPUTS", "false").lower() == "true"
 UPLOAD_DIR    = os.getenv("UPLOAD_DIR", "/data/uploads")
 OUTPUT_DIR    = os.getenv("OUTPUT_DIR", "/data/outputs")
 
-# Azure OpenAI
-AZURE_ENDPOINT   = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
-AZURE_KEY        = os.getenv("AZURE_OPENAI_KEY", "").strip()
-AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "o4-mini").strip()
-AZURE_API_VER    = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview").strip()
+# Modes de traitement: "fast" | "quality"
+PROCESSING_MODE = os.getenv("PROCESSING_MODE", "quality").strip().lower()
+# Optionnel: permet de surcharger le mode via le formulaire (champ "mode")
+ALLOWED_MODES = {"fast", "quality"}
 
-# OCR (tunable sans rebuild)
+# OCR (piloté par PaddleOCR)
 OCR_ENABLED        = os.getenv("OCR_ENABLED", "true").lower() == "true"
-OCR_LANGS          = os.getenv("OCR_LANGS", "fra+eng").strip()
+# OCR_LANGS initialement "fra+eng" → on choisit un modèle principal pour PaddleOCR
+# (Paddle n’accepte pas "fra+eng"; on sélectionne 'fr' s’il y a "fra", sinon 'en')
+_OCR_LANG_RAW      = os.getenv("OCR_LANGS", "fra+eng").strip().lower()
+OCR_LANG           = "fr" if "fra" in _OCR_LANG_RAW else "en"
+
+# Les DPI servent surtout pour le raster PDF -> images
 OCR_DPI            = int(os.getenv("OCR_DPI", "350"))
 OCR_MAX_PAGES      = int(os.getenv("OCR_MAX_PAGES", "50"))
-OCR_MIN_CHARS      = int(os.getenv("OCR_MIN_CHARS", "500"))
-OCR_KEEP_SPACES    = os.getenv("OCR_KEEP_SPACES", "true").lower() == "true"
-OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,4,3,11").split(",")]
+OCR_MIN_CHARS      = int(os.getenv("OCR_MIN_CHARS", "500"))  # conservé pour compat, peu utilisé ici
+OCR_PSMS           = [p.strip() for p in os.getenv("OCR_PSMS", "6,4,3,11").split(",")]  # non-utilisé par Paddle, conservé pour compat
 OCR_DPI_CANDIDATES = [int(x) for x in os.getenv("OCR_DPI_CANDIDATES", "300,350,400").split(",")]
 OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
 
@@ -46,18 +48,14 @@ OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
 IMAGE_OCR_MODE = os.getenv("IMAGE_OCR_MODE", "smart").strip()  # smart | conservative | always | never
 IMAGE_OCR_MIN_WORDS = int(os.getenv("IMAGE_OCR_MIN_WORDS", "10"))
 OCR_TEXT_QUALITY_MIN = float(os.getenv("OCR_TEXT_QUALITY_MIN", "0.30"))
-OCR_DISABLE_PAGE_FALLBACK = os.getenv("OCR_DISABLE_PAGE_FALLBACK", "false").lower() == "true"  # Fallback OCR pages sans texte activé par défaut
+OCR_DISABLE_PAGE_FALLBACK = os.getenv("OCR_DISABLE_PAGE_FALLBACK", "false").lower() == "true"
 
-# Embedding images base64
-# none | ocr_only | all
+# Intégration images base64
 EMBED_IMAGES       = os.getenv("EMBED_IMAGES", "ocr_only").strip()
 IMG_FORMAT         = os.getenv("IMG_FORMAT", "jpeg").strip().lower()
 IMG_JPEG_QUALITY   = int(os.getenv("IMG_JPEG_QUALITY", "85"))
 IMG_MAX_WIDTH      = int(os.getenv("IMG_MAX_WIDTH", "1600"))
 IMG_ALT_PREFIX     = os.getenv("IMG_ALT_PREFIX", "Capture").strip()
-
-# (Optionnel) Azure Document Intelligence
-DEFAULT_DOCINTEL_ENDPOINT = os.getenv("DEFAULT_DOCINTEL_ENDPOINT", "").strip()
 
 # Dossiers persistants
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -66,7 +64,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="3.7-ocr-fallback+cleanup")
+app = FastAPI(title="MarkItDown API", version="3.8-paddleocr+modes")
 
 app.add_middleware(
     CORSMiddleware,
@@ -75,15 +73,6 @@ app.add_middleware(
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
-
-def get_azure_client() -> Optional[AzureOpenAI]:
-    if AZURE_ENDPOINT and AZURE_KEY:
-        return AzureOpenAI(
-            azure_endpoint=AZURE_ENDPOINT,
-            api_key=AZURE_KEY,
-            api_version=AZURE_API_VER
-        )
-    return None
 
 # ---------------------------
 # Helpers génériques & markdown
@@ -104,11 +93,10 @@ def _md_cleanup(md: str) -> str:
     lines = []
     for L in md.replace("\r", "").split("\n"):
         l = re.sub(r"[ \t]+$", "", L)
-        l = re.sub(r"^\s*[•·●◦▪]\s+", "- ", l)         # bullets unicode -> '- '
-        l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)  # "1)" ou "1]" -> "1. "
+        l = re.sub(r"^\s*[•·●◦▪]\s+", "- ", l)
+        l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)
         lines.append(l)
     txt = "\n".join(lines)
-    # Encadrer les grilles ASCII dans ```text
     txt = re.sub(
         r"(?:^|\n)((?:[|+\-=_].*\n){2,})",
         lambda m: "```text\n" + m.group(1).strip() + "\n```",
@@ -117,33 +105,28 @@ def _md_cleanup(md: str) -> str:
     return txt.strip()
 
 # ---------------------------
-# OCR utils
+# OCR utils (PaddleOCR)
 # ---------------------------
 _table_chars = re.compile(r"[|+\-=_]{3,}")
 
-def _tess_config(psm: str) -> str:
-    cfg = f"--psm {psm} --oem 1"
-    if OCR_KEEP_SPACES:
-        cfg += " -c preserve_interword_spaces=1"
-    return cfg
-
 def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
+    # léger prétraitement
     g = ImageOps.grayscale(im)
     g = ImageOps.autocontrast(g, cutoff=1)
     g = g.filter(ImageFilter.MedianFilter(size=3))
-    g = g.point(lambda p: 255 if p > 190 else (0 if p < 110 else p))
     return g
 
-def _score_text_for_table(txt: str) -> float:
-    if not txt:
-        return 0.0
-    lines = txt.splitlines()
-    n = max(1, len(lines))
-    pipes = sum(l.count("|") for l in lines)
-    plus  = sum(l.count("+") for l in lines)
-    dashes= sum(l.count("-") for l in lines)
-    ascii_blocks = sum(1 for l in lines if _table_chars.search(l))
-    return (pipes*1.0 + plus*0.6 + dashes*0.3 + ascii_blocks*2.0)/n + len(txt)/5000.0
+def _classify_ocr_block(txt: str) -> str:
+    t = (txt or "").strip()
+    if not t:
+        return ""
+    if re.search(r"^\s*\+.*[-+].*\+\s*$", t, flags=re.M) or re.search(r"^\s*\|.*\|\s*$", t, flags=re.M):
+        return f"```text\n{t}\n```"
+    if re.search(r"^\s*(\$|#)\s", t, flags=re.M) or "mysql>" in t:
+        if re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|SHOW|GRANT|CHANGE\s+MASTER|START\s+(SLAVE|REPLICA))\b", t, flags=re.I):
+            return f"```sql\n{t}\n```"
+        return f"```bash\n{t}\n```"
+    return t
 
 def _ocr_quality_score(txt: str) -> float:
     if not txt:
@@ -156,60 +139,73 @@ def _ocr_quality_score(txt: str) -> float:
     words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{3,12}", t)
     return max(0.0, min(1.0, 0.5 * alnum_ratio + 0.5 * min(1.0, n/600) + 0.02 * len(words)))
 
-def _fast_has_text(im: Image.Image, langs: str, min_words: int) -> bool:
-    try:
-        data = pytesseract.image_to_data(im, lang=langs, config="--psm 11 --oem 1", output_type=pytesseract.Output.DICT)
-        words = [w for w in (data.get("text") or []) if w and re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{2,}", w)]
-        return len(words) >= min_words
-    except Exception:
-        return False
+# Instanciation unique de PaddleOCR (langue en fonction de OCR_LANG et mode)
+def _build_paddle(mode: str) -> PaddleOCR:
+    # QUALITY: angle_cls True, rec_batch_num plus petit (qualité), det_db_box_thresh bas
+    # FAST: angle_cls False, rec_batch_num plus grand
+    if mode == "quality":
+        return PaddleOCR(
+            use_angle_cls=True,
+            lang=OCR_LANG,
+            det=True, rec=True,
+            rec_batch_num=6,
+            det_db_box_thresh=0.3,
+            det_limit_side_len=1536,
+        )
+    else:
+        return PaddleOCR(
+            use_angle_cls=False,
+            lang=OCR_LANG,
+            det=True, rec=True,
+            rec_batch_num=16,
+            det_db_box_thresh=0.5,
+            det_limit_side_len=960,
+        )
 
-def _classify_ocr_block(txt: str) -> str:
-    t = (txt or "").strip()
-    if not t:
-        return ""
-    # Tables ASCII détectées -> bloc de code
-    if re.search(r"^\s*\+.*[-+].*\+\s*$", t, flags=re.M) or re.search(r"^\s*\|.*\|\s*$", t, flags=re.M):
-        return f"```text\n{t}\n```"
-    # Lignes type console / SQL détectées -> bloc de code approprié
-    if re.search(r"^\s*(\$|#)\s", t, flags=re.M) or "mysql>" in t:
-        if re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|SHOW|GRANT|CHANGE\s+MASTER|START\s+(SLAVE|REPLICA))\b", t, flags=re.I):
-            return f"```sql\n{t}\n```"
-        return f"```bash\n{t}\n```"
-    return t
+# OCR instances (une par mode) — chargées à la demande
+_PADDLE_INSTANCES: Dict[str, PaddleOCR] = {}
 
-def _ocr_image_best(im: Image.Image, langs: str) -> Tuple[str, float]:
-    # Appliquer OCR (plusieurs PSM, prétraitements) et renvoyer le meilleur texte + score qualité
+def _get_ocr(mode: str) -> PaddleOCR:
+    if mode not in _PADDLE_INSTANCES:
+        _PADDLE_INSTANCES[mode] = _build_paddle(mode)
+    return _PADDLE_INSTANCES[mode]
+
+def _paddle_ocr_text(im: Image.Image, mode: str) -> Tuple[str, float]:
     if im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
-    im2 = _preprocess_for_ocr(im)
-    best_txt, best_score = "", -1e9
-    for psm in OCR_PSMS:
-        cfg = _tess_config(psm)
-        t1 = pytesseract.image_to_string(im, lang=langs, config=cfg) or ""
-        s1 = _score_text_for_table(t1)
-        cand_txt, cand_score = t1, s1
-        t2 = pytesseract.image_to_string(im2, lang=langs, config=cfg) or ""
-        s2 = _score_text_for_table(t2)
-        if s2 > cand_score:
-            cand_txt, cand_score = t2, s2
-        if cand_score > best_score:
-            best_txt, best_score = cand_txt, cand_score
-        if best_score >= OCR_SCORE_GOOD_ENOUGH:
-            break
-    q = _ocr_quality_score(best_txt)
-    if q < OCR_TEXT_QUALITY_MIN:
-        return "", q
-    return best_txt.strip(), q
+    # Prétraitement léger seulement en QUALITY
+    if mode == "quality":
+        im = _preprocess_for_ocr(im)
+    ocr = _get_ocr(mode)
+    res = ocr.ocr(np_img := (im if isinstance(im, Image.Image) else im), cls=True)
+    # res est une liste par image; on prend la première
+    lines = []
+    if res and isinstance(res, list):
+        for page in res:
+            if not page:
+                continue
+            for det in page:
+                # det: [box, (text, score)]
+                try:
+                    txt = det[1][0]
+                    if txt:
+                        lines.append(txt)
+                except Exception:
+                    continue
+    text = "\n".join(lines).strip()
+    return text, _ocr_quality_score(text)
 
-def ocr_image_bytes(img_bytes: bytes, langs: str) -> Tuple[str, float]:
-    # OCR d'une image isolée (renvoie texte OCRisé formaté + score qualité)
+def _fast_has_text_with_paddle(im: Image.Image, mode: str, min_words: int) -> bool:
+    txt, _ = _paddle_ocr_text(im, mode)
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]{2,}", txt)
+    return len(words) >= min_words
+
+def ocr_image_bytes(img_bytes: bytes, mode: str) -> Tuple[str, float]:
     with Image.open(io.BytesIO(img_bytes)) as im:
-        txt, score = _ocr_image_best(im, langs)
+        txt, score = _paddle_ocr_text(im, mode)
         return _classify_ocr_block(txt), score
 
 def _raster_pdf_page(page: fitz.Page, dpi: int) -> Image.Image:
-    # Rendu raster d'une page PDF entière à la résolution souhaitée
     scale = dpi / 72.0
     mat = fitz.Matrix(scale, scale)
     pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -248,7 +244,7 @@ def crop_bbox_image(page: fitz.Page, bbox: Tuple[float, float, float, float], dp
         return None
 
 # ---------------------------
-# PDF inline : texte + images (OCR smart) + fallback contrôlé
+# PDF inline : texte + images (OCR smart) + fallback
 # ---------------------------
 def _is_bold(flags: int) -> bool:
     return bool(flags & 1 or flags & 32)  # BOLD | FAKEBOLD
@@ -317,10 +313,18 @@ def _wrap_tables_as_code(txt: str) -> str:
         out.extend(buf); out.append("```")
     return "\n".join(out)
 
-def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
+def render_pdf_markdown_inline(pdf_bytes: bytes, mode: str) -> Tuple[str, Dict[str, Any]]:
+    # Ajustements selon le mode
+    if mode == "fast":
+        dpi_page = min(OCR_DPI, 300)
+        dpi_candidates = [min(x, 300) for x in OCR_DPI_CANDIDATES[:2]]
+    else:
+        dpi_page = OCR_DPI
+        dpi_candidates = OCR_DPI_CANDIDATES
+
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     md_lines: List[str] = []
-    meta: Dict[str, Any] = {"engine": "pymupdf_inline", "pages": doc.page_count}
+    meta: Dict[str, Any] = {"engine": f"pymupdf_inline+paddleocr({mode})", "pages": doc.page_count}
     try:
         total_pages = min(doc.page_count, OCR_MAX_PAGES)
         for p in range(total_pages):
@@ -335,7 +339,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
             page_h = page.rect.height
             page_area = max(1.0, page_w * page_h)
 
-            # 1) TEXTE (par LIGNE) + marquage images (traitées ensuite)
+            # 1) TEXTE (lignes)
             for b in raw.get("blocks", []):
                 btype = b.get("type", 0)
                 bbox = tuple(b.get("bbox", (0, 0, 0, 0)))
@@ -344,7 +348,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
                 y0 = max(0.0, min(y0, page_h)); y1 = max(0.0, min(y1, page_h))
                 bbox = (x0, y0, x1, y1)
 
-                if btype == 0:  # bloc texte
+                if btype == 0:  # texte
                     for line in b.get("lines", []):
                         spans = line.get("spans", [])
                         if not spans:
@@ -366,7 +370,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
                             "area_ratio": ((lx1 - lx0) * (ly1 - ly0)) / page_area
                         })
 
-                elif btype == 1:  # bloc image
+                elif btype == 1:  # image
                     atoms.append({
                         "bbox": bbox,
                         "md": None,
@@ -375,37 +379,31 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
                         "area_ratio": ((x1 - x0) * (y1 - y0)) / page_area
                     })
 
-            has_vector_text = any(a["kind"] == "text" for a in atoms)
-
-            # 2) IMAGES -> OCR (selon mode) ou embed base64
+            # 2) IMAGES -> OCR (Paddle) ou embed base64
             processed = []
             for a in atoms:
                 if a["kind"] != "image_raw":
                     processed.append(a)
                     continue
 
-                im = crop_bbox_image(page, a["bbox"], OCR_DPI)
+                im = crop_bbox_image(page, a["bbox"], dpi_page)
                 if im is None:
                     continue
 
-                area_ratio = a["area_ratio"]
-                is_background_like = area_ratio > 0.85
-
-                # Mode "never": pas d'OCR
-                # Mode "smart": OCR seulement si l'image contient du texte
-                # Modes "always" et "conservative": OCR sur toutes les images (y compris plein-page)
-                do_img_ocr = False
+                # Décision d'OCR
                 if IMAGE_OCR_MODE == "never":
                     do_img_ocr = False
                 elif IMAGE_OCR_MODE == "smart":
-                    do_img_ocr = _fast_has_text(im, OCR_LANGS, IMAGE_OCR_MIN_WORDS)
+                    do_img_ocr = _fast_has_text_with_paddle(im, mode, IMAGE_OCR_MIN_WORDS)
+                elif IMAGE_OCR_MODE in ("always", "conservative"):
+                    do_img_ocr = True
                 else:
                     do_img_ocr = True
 
                 md_img = ""
                 txt, q = "", 0.0
                 if do_img_ocr:
-                    txt, q = _ocr_image_best(im, OCR_LANGS)
+                    txt, q = _paddle_ocr_text(im, mode)
 
                 if txt and q >= OCR_TEXT_QUALITY_MIN:
                     md_img = _classify_ocr_block(txt.strip())
@@ -421,19 +419,19 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
                         "md": md_img,
                         "kind": "image",
                         "text_len": len(txt or ""),
-                        "area_ratio": area_ratio
+                        "area_ratio": a["area_ratio"]
                     })
 
             atoms = processed
 
-            # 3) Tri de lecture simple (haut → bas, gauche → droite)
+            # 3) Tri de lecture
             def sort_key(a):
                 x0, y0, x1, y1 = a["bbox"]
                 y_center = 0.5 * (y0 + y1)
                 return (int(y_center / band_h), x0, y0)
             atoms.sort(key=sort_key)
 
-            # 4) Concaténation lignes + wrap tableaux
+            # 4) Concaténation & wrap tableaux
             page_buf: List[str] = []
             para_buf: List[str] = []
             last_band = None
@@ -463,15 +461,14 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
                     page_buf.append(md)
             flush_para()
 
-            # Indicateur texte extrait sur la page (vectoriel ou OCR)
             has_text_content = any(a["text_len"] > 0 for a in atoms)
-            # 5) Fallback OCR page : uniquement si aucun texte extrait et fallback activé
-            if not has_text_content and not OCR_DISABLE_PAGE_FALLBACK:
+            # 5) Fallback OCR page si rien d’extrait
+            if not has_text_content and not OCR_DISABLE_PAGE_FALLBACK and OCR_ENABLED:
                 try:
                     best_txt, best_score = "", -1e9
-                    for d in OCR_DPI_CANDIDATES:
+                    for d in dpi_candidates:
                         im_page = _raster_pdf_page(page, d)
-                        txt, score = _ocr_image_best(im_page, OCR_LANGS)
+                        txt, score = _paddle_ocr_text(im_page, mode)
                         if score > best_score:
                             best_txt, best_score = txt, score
                         if best_score >= OCR_SCORE_GOOD_ENOUGH:
@@ -491,7 +488,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
         doc.close()
 
 # ---------------------------
-# UI web (exactement comme ton origine, avec sliders .switch)
+# UI web (inchangée visuellement)
 # ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
@@ -591,7 +588,6 @@ HTML_PAGE = r'''<!doctype html>
     }
     .muted{color:var(--muted)}
 
-    /* Dropzone */
     .drop{
       border:1.5px dashed rgba(255,255,255,0.18);
       border-radius:14px;
@@ -606,7 +602,6 @@ HTML_PAGE = r'''<!doctype html>
 
     .filemeta{font-size:.95rem; color:var(--text); opacity:.9}
 
-    /* Switches (sliders) */
     .switch{position:relative; display:inline-block; width:44px; height:24px}
     .switch input{opacity:0; width:0; height:0}
     .slider{
@@ -713,7 +708,6 @@ HTML_PAGE = r'''<!doctype html>
 const $ = (id) => document.getElementById(id);
 const endpoint = "/convert";
 
-// drag & drop + meta
 (function(){
   const dz = $("dropzone"), fi = $("file"), fm = $("filemeta");
   function prettySize(bytes){ if(bytes < 1024) return bytes + " B"; if(bytes < 1048576) return (bytes/1024).toFixed(1) + " KB"; return (bytes/1048576).toFixed(1) + " MB"; }
@@ -725,7 +719,6 @@ const endpoint = "/convert";
   fi.addEventListener("change", () => showMeta(fi.files[0]));
 })();
 
-// Timer + counters
 let timerId = null, t0 = 0;
 function startTimer(){ stopTimer(); t0 = performance.now(); timerId = setInterval(() => { const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); }, 100); }
 function stopTimer(final = false){ if(timerId){ clearInterval(timerId); timerId = null; } if(final){ const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); } }
@@ -749,7 +742,6 @@ $("clear").onclick = () => {
   setTimeout(() => { $("status").textContent = ""; }, 1200); 
 };
 
-// Convertir le document
 $("convert").onclick = async () => {
   const f = $("file").files[0];
   if(!f){ alert("Choisissez un fichier."); return; }
@@ -767,6 +759,8 @@ $("convert").onclick = async () => {
   fd.append("use_llm", $("llm").checked ? "true" : "false");
   fd.append("docintel_endpoint", $("di").value || "");
   fd.append("force_ocr", $("forceocr").checked ? "true" : "false");
+  // NOTE: champ 'mode' non exposé dans l'UI, mais accepté par l'API si besoin futur
+  // fd.append("mode", "quality" | "fast");
 
   try {
     const res = await fetch(endpoint, { method: "POST", body: fd });
@@ -802,10 +796,6 @@ $("md").addEventListener("input", updateCounters);
 def index():
     return HTMLResponse(HTML_PAGE)
 
-@app.get("/config", response_class=JSONResponse)
-def get_config():
-    return JSONResponse({"docintel_default": DEFAULT_DOCINTEL_ENDPOINT})
-
 # ---------------------------
 # Endpoint API de conversion
 # ---------------------------
@@ -813,27 +803,27 @@ def get_config():
 async def convert(
     file: UploadFile = File(...),
     use_plugins: bool = Form(False),
-    docintel_endpoint: Optional[str] = Form(None),
-    llm_model: Optional[str] = Form(None),   # ignoré pour Azure; gardé pour compat
-    use_llm: bool = Form(False),
+    docintel_endpoint: Optional[str] = Form(None),   # ignoré désormais
+    llm_model: Optional[str] = Form(None),           # ignoré
+    use_llm: bool = Form(False),                     # ignoré
     force_ocr: bool = Form(False),
+    mode: Optional[str] = Form(None),                # "fast" | "quality" (optionnel)
 ):
     """
     - Plugins OFF : MarkItDown simple (+ cleanup).
-    - Plugins ON (PDF + OCR forcé) : PyMuPDF inline → texte vectoriel + OCR “smart” des captures, fallback page si pas de texte, Markdown nettoyé.
+    - Plugins ON + PDF : extraction inline (texte vectoriel) + OCR Paddle sur images, fallback page si pas de texte.
     - Image seule : OCR + base64 si OCR pauvre.
+    - LLM & Azure DI : retirés (inactifs).
+    - Mode de traitement : 'quality' (par défaut) ou 'fast' (plus rapide).
     """
     try:
         t_start = time.perf_counter()
-
-        if not docintel_endpoint:
-            docintel_endpoint = DEFAULT_DOCINTEL_ENDPOINT
 
         content = await file.read()
         if not content:
             raise HTTPException(status_code=400, detail="Fichier vide")
 
-        # Sauvegarde du fichier source si demandé
+        # Sauvegarde du fichier source
         in_path = None
         if SAVE_UPLOADS:
             in_path = os.path.join(UPLOAD_DIR, file.filename)
@@ -843,32 +833,30 @@ async def convert(
         is_pdf = guess_is_pdf(file.filename, file.content_type)
         is_img = guess_is_image(file.filename, file.content_type)
 
-        metadata: Dict[str, Any] = {}
+        # Sélection du mode
+        selected_mode = (mode or PROCESSING_MODE).lower()
+        if selected_mode not in ALLOWED_MODES:
+            selected_mode = "quality"
 
-        if is_pdf and use_plugins and OCR_ENABLED and force_ocr:
-            # Pipeline PDF inline : texte + images (OCR “smart”) in‑place
-            markdown, meta_pdf = render_pdf_markdown_inline(content)
+        metadata: Dict[str, Any] = {"processing_mode": selected_mode}
+
+        if is_pdf and use_plugins and OCR_ENABLED and (force_ocr or True):
+            markdown, meta_pdf = render_pdf_markdown_inline(content, selected_mode)
             metadata.update(meta_pdf)
-            # Nettoyage du Markdown final
             markdown = _md_cleanup(markdown)
-
         else:
-            # Conversion MarkItDown générique
-            md_engine = MarkItDown(enable_plugins=use_plugins, docintel_endpoint=docintel_endpoint)
+            md_engine = MarkItDown(enable_plugins=use_plugins, docintel_endpoint=None)
             result = md_engine.convert_stream(io.BytesIO(content), file_name=file.filename)
-
             markdown = getattr(result, "text_content", "") or ""
             metadata.update(getattr(result, "metadata", {}) or {})
             warnings = getattr(result, "warnings", None)
             if warnings:
                 metadata["warnings"] = warnings
-
-            # Post-traitement Markdown
             markdown = _md_cleanup(markdown)
 
-            # Image isolée + OCR local
+            # Image isolée + OCR local (Paddle)
             if OCR_ENABLED and is_img:
-                ocr_text, score = ocr_image_bytes(content, OCR_LANGS)
+                ocr_text, score = ocr_image_bytes(content, selected_mode)
                 if ocr_text.strip():
                     markdown += "\n\n# OCR (extrait)\n" + ocr_text
                 if EMBED_IMAGES in ("all", "ocr_only") and (not ocr_text or score < OCR_TEXT_QUALITY_MIN):
@@ -880,7 +868,7 @@ async def convert(
                     except Exception:
                         pass
 
-        # Sauvegarde du résultat Markdown si demandé
+        # Sauvegarde résultat
         out_name = f"{os.path.splitext(file.filename)[0]}.md"
         out_path = None
         if SAVE_OUTPUTS:
@@ -888,40 +876,8 @@ async def convert(
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(markdown)
 
-        # Résumé Azure OpenAI (optionnel)
-        if use_llm:
-            client = get_azure_client()
-            if client:
-                try:
-                    snippet = markdown[:12000] if markdown else "[document vide]"
-                    resp = client.chat.completions.create(
-                        model=AZURE_DEPLOYMENT,
-                        messages=[
-                            {"role": "system", "content": "Tu es un assistant qui résume des documents techniques en français, de manière concise et structurée."},
-                            {"role": "user", "content": f"Résume le document suivant en 10 points maximum, avec un titre en H1 et des sous-titres:\n\n{snippet}"}
-                        ],
-                        max_completion_tokens=800
-                    )
-                    content_msg = None
-                    if resp and getattr(resp, "choices", None):
-                        msg = resp.choices[0].message
-                        if hasattr(msg, "content") and isinstance(msg.content, str):
-                            content_msg = msg.content
-                        elif hasattr(msg, "content") and isinstance(msg.content, list):
-                            parts = []
-                            for part in msg.content:
-                                if isinstance(part, dict) and "text" in part:
-                                    parts.append(part["text"])
-                            content_msg = "".join(parts) if parts else None
-                    metadata["azure_summary"] = content_msg or "[Résumé vide (vérifie le déploiement et le contenu)]"
-                except Exception as e:
-                    metadata["azure_summary"] = f"[Erreur Azure OpenAI: {type(e).__name__}: {e}]"
-            else:
-                metadata["azure_summary"] = "[Azure OpenAI non configuré]"
-
-        # Durée de traitement côté serveur
+        # Durée de traitement
         metadata["duration_sec"] = round(time.perf_counter() - t_start, 3)
-
         if SAVE_UPLOADS and in_path:
             metadata["saved_input_path"] = in_path
         if SAVE_OUTPUTS and out_path:
