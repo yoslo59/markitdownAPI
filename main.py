@@ -15,9 +15,11 @@ from markitdown import MarkItDown
 
 # OCR & Images
 import numpy as np
-from paddleocr import PaddleOCR
+from paddleocr import PaddleOCR, PPStructure
 from PIL import Image, ImageOps, ImageFilter
 import fitz  # PyMuPDF
+from html.parser import HTMLParser
+import html
 
 # ---------------------------
 # Config via variables d'env
@@ -42,11 +44,11 @@ OCR_DPI_CANDIDATES = [int(x) for x in os.getenv("OCR_DPI_CANDIDATES", "300,350,4
 OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
 
 # Politique OCR images & fallback
-# NOTE: en mode "plugins ON", on force "always" en pratique (comme Marker)
+# En “plugins ON”, on lance l’OCR image systématiquement (comme Marker).
 IMAGE_OCR_MODE = os.getenv("IMAGE_OCR_MODE", "smart").strip()  # smart | conservative | always | never
 IMAGE_OCR_MIN_WORDS = int(os.getenv("IMAGE_OCR_MIN_WORDS", "10"))
-OCR_TEXT_QUALITY_MIN = float(os.getenv("OCR_TEXT_QUALITY_MIN", "0.30"))
-OCR_MIN_ACCEPT_LEN = int(os.getenv("OCR_MIN_ACCEPT_LEN", "12"))  # seuil mini de caractères pour accepter un OCR "forcé"
+OCR_TEXT_QUALITY_MIN = float(os.getenv("OCR_TEXT_QUALITY_MIN", "0.25"))
+OCR_MIN_ACCEPT_LEN = int(os.getenv("OCR_MIN_ACCEPT_LEN", "10"))
 OCR_DISABLE_PAGE_FALLBACK = os.getenv("OCR_DISABLE_PAGE_FALLBACK", "false").lower() == "true"
 
 # Intégration images base64
@@ -55,7 +57,7 @@ IMG_FORMAT         = os.getenv("IMG_FORMAT", "png").strip().lower()
 IMG_JPEG_QUALITY   = int(os.getenv("IMG_JPEG_QUALITY", "85"))
 IMG_MAX_WIDTH      = int(os.getenv("IMG_MAX_WIDTH", "1600"))
 IMG_ALT_PREFIX     = os.getenv("IMG_ALT_PREFIX", "Capture").strip()
-EMBED_SKIP_BG_IF_TEXT = os.getenv("EMBED_SKIP_BG_IF_TEXT", "true").lower() == "true"  # saute les images plein-page si la page a déjà du texte
+EMBED_SKIP_BG_IF_TEXT = os.getenv("EMBED_SKIP_BG_IF_TEXT", "true").lower() == "true"
 
 # Dossiers persistants
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -64,7 +66,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="4.6-inline-ocr-titles-tables+paddle")
+app = FastAPI(title="MarkItDown API", version="4.9-ppstructure-tables+paddleocr-inline")
 
 app.add_middleware(
     CORSMiddleware,
@@ -93,11 +95,10 @@ def _md_cleanup(md: str) -> str:
     lines = []
     for L in md.replace("\r", "").split("\n"):
         l = re.sub(r"[ \t]+$", "", L)
-        l = re.sub(r"^\s*[•·●◦▪]\s+", "- ", l)          # bullets unicode -> '- '
-        l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)   # "1)" ou "1]" -> "1. "
+        l = re.sub(r"^\s*[•·●◦▪]\s+", "- ", l)
+        l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)
         lines.append(l)
     txt = "\n".join(lines)
-    # Encadrer grilles ASCII dans ```text
     txt = re.sub(
         r"(?:^|\n)((?:[|+\-=_].*\n){2,})",
         lambda m: "```text\n" + m.group(1).strip() + "\n```",
@@ -106,7 +107,7 @@ def _md_cleanup(md: str) -> str:
     return txt.strip()
 
 # ---------------------------
-# OCR utils (PaddleOCR)
+# OCR utils (PaddleOCR + PPStructure)
 # ---------------------------
 _table_chars = re.compile(r"[|+\-=_]{3,}")
 
@@ -120,10 +121,8 @@ def _classify_ocr_block(txt: str) -> str:
     t = (txt or "").strip()
     if not t:
         return ""
-    # Tables ASCII -> bloc code text
     if re.search(r"^\s*\+.*[-+].*\+\s*$", t, flags=re.M) or re.search(r"^\s*\|.*\|\s*$", t, flags=re.M):
         return f"```text\n{t}\n```"
-    # Consoles/SQL -> bloc code
     if re.search(r"^\s*(\$|#)\s", t, flags=re.M) or "mysql>" in t:
         if re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|SHOW|GRANT|CHANGE\s+MASTER|START\s+(SLAVE|REPLICA))\b", t, flags=re.I):
             return f"```sql\n{t}\n```"
@@ -165,19 +164,23 @@ def _paddle_key(mode: str, lang: str) -> str:
     return f"{mode}:{lang}"
 
 def _build_paddle(mode: str, lang: str) -> PaddleOCR:
-    return PaddleOCR(
-        use_angle_cls=(mode == "quality"),
-        lang=lang,
-        show_log=False,
-    )
+    return PaddleOCR(use_angle_cls=(mode == "quality"), lang=lang, show_log=False)
 
 _PADDLE_INSTANCES: Dict[str, PaddleOCR] = {}
+_PPSTRUCT_INSTANCES: Dict[str, PPStructure] = {}
 
 def _get_ocr(mode: str, lang: str) -> PaddleOCR:
     key = _paddle_key(mode, lang)
     if key not in _PADDLE_INSTANCES:
         _PADDLE_INSTANCES[key] = _build_paddle(mode, lang)
     return _PADDLE_INSTANCES[key]
+
+def _get_table_engine(mode: str) -> PPStructure:
+    # PPStructure: on reste sur 'en' (latin) pour la structure/table.
+    key = f"ppstruct:{mode}"
+    if key not in _PPSTRUCT_INSTANCES:
+        _PPSTRUCT_INSTANCES[key] = PPStructure(show_log=False, lang='en')  # télécharge modèles au 1er run
+    return _PPSTRUCT_INSTANCES[key]
 
 def _paddle_ocr_text_best(im: Image.Image, mode: str, langs: Optional[List[str]] = None) -> Tuple[str, float, str]:
     if im.mode not in ("RGB", "L"):
@@ -216,6 +219,99 @@ def _paddle_ocr_text_best(im: Image.Image, mode: str, langs: Optional[List[str]]
 
     return best_txt, best_score, best_lang
 
+def _ppstruct_tables_to_md(img: Image.Image) -> Optional[str]:
+    """
+    Utilise PPStructure pour détecter/reconstruire les tableaux en Markdown.
+    Retourne du Markdown (sans texte hors-table), ou None si pas de table.
+    """
+    try:
+        engine = _get_table_engine("quality")  # structure moins sensible au mode
+        nd = np.array(img.convert("RGB"))
+        result = engine(nd)  # liste d'éléments: type in {'table','text','title','figure'}
+        tables_md: List[str] = []
+        for item in result:
+            if item.get('type') != 'table':
+                continue
+            res = item.get('res', {})
+            html_str = res.get('html', '')
+            md = _html_table_to_markdown(html_str)
+            if md:
+                tables_md.append(md)
+        if tables_md:
+            return "\n\n".join(tables_md)
+        return None
+    except Exception:
+        return None
+
+class _TableHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_table = False
+        self.in_tr = False
+        self.in_cell = False
+        self.headers: List[str] = []
+        self.rows: List[List[str]] = []
+        self.current_row: List[str] = []
+        self.buf: List[str] = []
+        self.is_th = False
+
+    def handle_starttag(self, tag, attrs):
+        t = tag.lower()
+        if t == "table":
+            self.in_table = True
+        elif t == "tr" and self.in_table:
+            self.in_tr = True
+            self.current_row = []
+        elif t in ("td", "th") and self.in_tr:
+            self.in_cell = True
+            self.buf = []
+            self.is_th = (t == "th")
+
+    def handle_data(self, data):
+        if self.in_cell:
+            self.buf.append(data)
+
+    def handle_endtag(self, tag):
+        t = tag.lower()
+        if t in ("td", "th") and self.in_cell:
+            txt = html.unescape("".join(self.buf)).strip()
+            txt = re.sub(r"\s*\|\s*", " ", txt)  # éviter les pipes qui cassent le markdown
+            self.current_row.append(txt)
+            self.in_cell = False
+            self.is_th = False
+        elif t == "tr" and self.in_tr:
+            if self.current_row:
+                # s'il y a une ligne d'en-têtes évidente (th) PP-Structure l'a déjà mise au début
+                self.rows.append(self.current_row)
+            self.in_tr = False
+        elif t == "table":
+            self.in_table = False
+
+def _html_table_to_markdown(html_str: str) -> Optional[str]:
+    if not html_str or "<table" not in html_str.lower():
+        return None
+    parser = _TableHTMLParser()
+    try:
+        parser.feed(html_str)
+        rows = [r for r in parser.rows if any(cell.strip() for cell in r)]
+        if not rows:
+            return None
+        # largeur max uniformisée
+        cols = max(len(r) for r in rows)
+        norm = [r + [""] * (cols - len(r)) for r in rows]
+        # première ligne = en-têtes
+        head = norm[0]
+        sep = ["---"] * cols
+        body = norm[1:] if len(norm) > 1 else []
+        md = []
+        md.append("| " + " | ".join(head) + " |")
+        md.append("| " + " | ".join(sep) + " |")
+        for r in body:
+            md.append("| " + " | ".join(r) + " |")
+        return "\n".join(md)
+    except Exception:
+        return None
+
 def _fast_has_text_with_paddle(im: Image.Image, mode: str, min_words: int) -> bool:
     try:
         txt, _, _ = _paddle_ocr_text_best(im, mode)
@@ -226,6 +322,10 @@ def _fast_has_text_with_paddle(im: Image.Image, mode: str, min_words: int) -> bo
 
 def ocr_image_bytes(img_bytes: bytes, mode: str) -> Tuple[str, float, str]:
     with Image.open(io.BytesIO(img_bytes)) as im:
+        # D’abord tenter une table via PPStructure
+        md_table = _ppstruct_tables_to_md(im)
+        if md_table:
+            return md_table, 1.0, "en(struct)"  # on considère “qualité OK”
         txt, score, used_lang = _paddle_ocr_text_best(im, mode)
         return _classify_ocr_block(txt), score, used_lang
 
@@ -276,7 +376,7 @@ def _hash_image_for_dedup(im: Image.Image) -> str:
     return hashlib.md5(buf.getvalue()).hexdigest()
 
 # ---------------------------
-# PDF inline : texte + images (OCR smart) + fallback + tables
+# PDF inline : texte + images (OCR + PPStructure) + fallback
 # ---------------------------
 def _is_bold(flags: int) -> bool:
     return bool(flags & 1 or flags & 32)
@@ -299,7 +399,6 @@ def _median_font_size(page_raw: Dict[str, Any]) -> float:
 def _classify_heading(size: float, median_size: float, has_bold: bool) -> Optional[str]:
     if median_size <= 0:
         return None
-    # Un peu plus agressif : si bold + > 1.1x médiane, on titre
     if size >= median_size * 1.8: return "#"
     if size >= median_size * 1.5: return "##"
     if has_bold and size >= median_size * 1.1: return "###"
@@ -324,7 +423,6 @@ def _line_to_md(spans: List[Dict[str, Any]], median_size: float) -> str:
     raw = "".join(parts).strip()
     if not raw:
         return ""
-    # Titre ?
     h = _classify_heading(max_size, median_size, any_bold)
     if h and len(raw) < 180:
         return f"{h} {raw}"
@@ -351,32 +449,12 @@ def _wrap_tables_as_code(txt: str) -> str:
         out.extend(buf); out.append("```")
     return "\n".join(out)
 
-def _band_is_table_row(cells: List[Tuple[float, float, str]], page_w: float) -> bool:
-    """
-    Heuristique : au moins 2 "cellules" dans la même bande, couvrant > 45% de la largeur,
-    avec un gap médian > 50 px → on considère une ligne de tableau (2–3 colonnes).
-    """
-    if len(cells) < 2 or len(cells) > 4:
-        return False
-    cells_sorted = sorted(cells, key=lambda c: c[0])
-    span = cells_sorted[-1][1] - cells_sorted[0][0]
-    if span < 0.45 * page_w:
-        return False
-    gaps = []
-    for i in range(len(cells_sorted) - 1):
-        gaps.append(cells_sorted[i+1][0] - cells_sorted[i][1])
-    if not gaps:
-        return False
-    gaps.sort()
-    return gaps[len(gaps)//2] > 50.0
-
 def render_pdf_markdown_inline(
     pdf_bytes: bytes,
     mode: str,
     meta_out: Dict[str, Any],
     force_ocr_images: bool = False
 ) -> Tuple[str, Dict[str, Any]]:
-    # DPI/mode
     if mode == "fast":
         dpi_page = min(OCR_DPI, 300)
         dpi_candidates = [min(x, 300) for x in OCR_DPI_CANDIDATES[:2]]
@@ -384,17 +462,16 @@ def render_pdf_markdown_inline(
         dpi_page = OCR_DPI
         dpi_candidates = OCR_DPI_CANDIDATES
 
-    # En "plugins ON", on se comporte comme Marker : OCR images "always"
+    # En plugins ON, on OCR TOUJOURS les images
     img_ocr_policy = "always" if IMAGE_OCR_MODE != "never" else "never"
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     md_lines: List[str] = []
-    meta: Dict[str, Any] = {"engine": f"pymupdf_inline+paddleocr({mode})", "pages": doc.page_count}
+    meta: Dict[str, Any] = {"engine": f"pymupdf_inline+paddleocr+ppstructure({mode})", "pages": doc.page_count}
     try:
         total_pages = min(doc.page_count, OCR_MAX_PAGES)
         for p in range(total_pages):
             page = doc.load_page(p)
-
             raw = page.get_text("dict") or {}
 
             median_size = _median_font_size(raw)
@@ -415,7 +492,7 @@ def render_pdf_markdown_inline(
                 y0 = max(0.0, min(y0, page_h)); y1 = max(0.0, min(y1, page_h))
                 bbox = (x0, y0, x1, y1)
 
-                if btype == 0:  # bloc texte
+                if btype == 0:
                     for line in b.get("lines", []):
                         spans = line.get("spans", [])
                         if not spans:
@@ -440,7 +517,7 @@ def render_pdf_markdown_inline(
                             "area_ratio": ((lx1 - lx0) * (ly1 - ly0)) / page_area
                         })
 
-                elif btype == 1:  # bloc image
+                elif btype == 1:
                     atoms.append({
                         "bbox": bbox,
                         "md": None,
@@ -449,7 +526,7 @@ def render_pdf_markdown_inline(
                         "area_ratio": ((x1 - x0) * (y1 - y0)) / page_area
                     })
 
-            # 2) IMAGES -> OCR (Paddle) ou embed base64
+            # 2) IMAGES -> PPStructure (tables) puis OCR texte, sinon embed
             processed = []
             seen_hashes: set = set()
             page_has_vector_text = any(a["kind"] == "text" for a in atoms)
@@ -462,7 +539,6 @@ def render_pdf_markdown_inline(
                 if im is None:
                     continue
 
-                # dédup
                 h = _hash_image_for_dedup(im)
                 if h in seen_hashes:
                     continue
@@ -474,30 +550,35 @@ def render_pdf_markdown_inline(
                 # Politique d'OCR (always en plugins ON)
                 if img_ocr_policy == "never":
                     do_img_ocr = False
-                elif force_ocr_images or img_ocr_policy in ("always", "conservative"):
+                else:
                     do_img_ocr = True
-                else:  # smart (non utilisé ici, mais on garde la branche)
-                    do_img_ocr = _fast_has_text_with_paddle(im, mode, IMAGE_OCR_MIN_WORDS)
 
                 md_img = ""
                 txt, q, used_lang = "", 0.0, None
-                if do_img_ocr and OCR_ENABLED:
-                    try:
-                        txt, q, used_lang = _paddle_ocr_text_best(im, mode)
-                        if used_lang:
-                            meta_out.setdefault("ocr_used_langs", set()).add(used_lang)
-                    except Exception as e:
-                        meta_out.setdefault("ocr_errors", []).append(
-                            f"img_page_{p+1}: {type(e).__name__}: {e}"
-                        )
 
-                accept_low_quality = force_ocr_images and txt and len(txt) >= OCR_MIN_ACCEPT_LEN
+                if do_img_ocr and OCR_ENABLED:
+                    # 2.1 – d’abord PPStructure (tables)
+                    md_table = _ppstruct_tables_to_md(im)
+                    if md_table:
+                        md_img = md_table
+                        txt = md_table
+                        q = 1.0
+                        used_lang = "en(struct)"
+                    else:
+                        # 2.2 – texte classique
+                        try:
+                            txt, q, used_lang = _paddle_ocr_text_best(im, mode)
+                        except Exception as e:
+                            meta_out.setdefault("ocr_errors", []).append(
+                                f"img_page_{p+1}: {type(e).__name__}: {e}"
+                            )
+
+                accept_low_quality = (force_ocr_images and txt and len(txt) >= OCR_MIN_ACCEPT_LEN)
 
                 if (txt and q >= OCR_TEXT_QUALITY_MIN) or accept_low_quality:
                     md_img = _classify_ocr_block(txt.strip())
                     a_kind = "image_text"
                 else:
-                    # Pas de texte : on embed, sauf "plein-page" optionnel si la page a déjà du texte
                     if EMBED_IMAGES in ("all", "ocr_only"):
                         if not (EMBED_SKIP_BG_IF_TEXT and is_background_like and page_has_vector_text):
                             im = _pil_resize_max(im, IMG_MAX_WIDTH)
@@ -510,6 +591,9 @@ def render_pdf_markdown_inline(
                     else:
                         md_img = ""
                         a_kind = "image_skipped"
+
+                if used_lang:
+                    meta_out.setdefault("ocr_used_langs", set()).add(used_lang)
 
                 if md_img:
                     processed.append({
@@ -529,25 +613,19 @@ def render_pdf_markdown_inline(
 
             atoms = processed
 
-            # 3) Tri de lecture simple (haut → bas, gauche → droite)
+            # 3) Tri de lecture (haut→bas, gauche→droite)
             def sort_key(a):
                 x0, y0, x1, y1 = a["bbox"]
                 y_center = 0.5 * (y0 + y1)
                 return (int(y_center / band_h), x0, y0)
             atoms.sort(key=sort_key)
 
-            # 4) Concaténation lignes + détection de tableaux par bandes
+            # 4) Concaténation lignes + wrap tableaux ascii
             page_buf: List[str] = []
             para_buf: List[str] = []
             last_band = None
 
-            # Accumule les "cellules" d'une même bande pour décider table/texte
-            band_cells: List[Tuple[float, float, str]] = []
-            in_table = False
-            table_col_count = 0
-
             def flush_para():
-                nonlocal para_buf
                 if not para_buf:
                     return
                 block_txt = "\n".join(para_buf).strip()
@@ -556,84 +634,22 @@ def render_pdf_markdown_inline(
                         page_buf.append("```text"); page_buf.append(block_txt); page_buf.append("```")
                     else:
                         page_buf.append(block_txt)
-                para_buf = []
-
-            def flush_table():
-                nonlocal in_table, table_col_count
-                if in_table:
-                    # Rien à faire : on ferme logiquement
-                    in_table = False
-                    table_col_count = 0
-
-            def start_table(cols: int):
-                nonlocal in_table, table_col_count
-                if not in_table:
-                    in_table = True
-                    table_col_count = cols
-                    # On n'a pas d'en-têtes fiables → entêtes neutres
-                    headers = " | ".join([f"Col {i+1}" for i in range(cols)])
-                    sep = " | ".join(["---"] * cols)
-                    page_buf.append(f"| {headers} |")
-                    page_buf.append(f"| {sep} |")
-
-            def emit_table_row(cells: List[Tuple[float, float, str]]):
-                cells_sorted = sorted(cells, key=lambda c: c[0])
-                row = [c[2].strip() for c in cells_sorted]
-                # normalisation pipes
-                row = [re.sub(r"\s*\|\s*", " ", c) for c in row]
-                page_buf.append("| " + " | ".join(row) + " |")
+                para_buf.clear()
 
             for a in atoms:
                 x0, y0, x1, y1 = a["bbox"]
                 y_center = 0.5 * (y0 + y1)
                 band = int(y_center / band_h)
-
-                # changement de bande -> décider si la précédente forme une ligne de tableau
+                md = a["md"]
                 if last_band is not None and band != last_band:
-                    if band_cells and _band_is_table_row(band_cells, page_w):
-                        # on était en texte ? on flush le paragraphe et on passe en "table"
-                        if not in_table:
-                            flush_para()
-                            start_table(cols=min(4, max(2, len(band_cells))))
-                        emit_table_row(band_cells)
-                    else:
-                        # bande non-table
-                        if in_table:
-                            flush_table()
-                        # pas de flush ici : les lignes textes restent dans para_buf
-                    band_cells = []
-
+                    flush_para()
                 last_band = band
-
                 if a["kind"] == "text":
-                    # Accumule pour éventuelle table
-                    band_cells.append((x0, x1, a["md"]))
-                    # Si on n'est pas en mode table, on garde aussi pour paragraphe
-                    if not in_table:
-                        para_buf.append(a["md"])
+                    para_buf.append(md)
                 else:
-                    # image : couper paragraphe / table en cours
-                    if band_cells and _band_is_table_row(band_cells, page_w):
-                        if not in_table:
-                            flush_para()
-                            start_table(cols=min(4, max(2, len(band_cells))))
-                        emit_table_row(band_cells)
-                        band_cells = []
-                    if in_table:
-                        flush_table()
                     flush_para()
-                    page_buf.append(a["md"])
-
-            # Fin de page : traiter la dernière bande
-            if band_cells and _band_is_table_row(band_cells, page_w):
-                if not in_table:
-                    flush_para()
-                    start_table(cols=min(4, max(2, len(band_cells))))
-                emit_table_row(band_cells)
-            else:
-                if in_table:
-                    flush_table()
-                flush_para()
+                    page_buf.append(md)
+            flush_para()
 
             # 5) Fallback OCR page si rien d’extrait
             has_any_text = any(a.get("kind") == "text" for a in atoms) or \
@@ -665,7 +681,6 @@ def render_pdf_markdown_inline(
 
         final_md = "\n\n".join([l for l in md_lines if l.strip()]).strip()
 
-        # sérialiser l'ensemble des langues utilisées (set -> list)
         if "ocr_used_langs" in meta_out and isinstance(meta_out["ocr_used_langs"], set):
             meta_out["ocr_used_langs"] = sorted(list(meta_out["ocr_used_langs"]))
 
@@ -674,7 +689,7 @@ def render_pdf_markdown_inline(
         doc.close()
 
 # ---------------------------
-# UI web (switch sliders rétablis + progress fixée)
+# UI web (sliders + progress OK)
 # ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
@@ -894,9 +909,9 @@ let timerId = null, t0 = 0;
 function startTimer(){ stopTimer(); t0 = performance.now(); timerId = setInterval(() => { const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); }, 100); }
 function stopTimer(final = false){ if(timerId){ clearInterval(timerId); timerId = null; } if(final){ const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); } }
 function updateCounters(){ const txt = $("md").value || ""; $("charcount").textContent = txt.length.toString(); $("linecount").textContent = (txt ? txt.split(/\r?\n/).length : 0).toString(); }
-$("copy").onclick = async () => { 
-  try { await navigator.clipboard.writeText($("md").value || ""); $("status").textContent = "Markdown copié"; setTimeout(() => { $("status").textContent = ""; }, 1200); } 
-  catch { $("status").textContent = "Impossible de copier."; } 
+$("copy").onclick = async () => {
+  try { await navigator.clipboard.writeText($("md").value || ""); $("status").textContent = "Markdown copié"; setTimeout(() => { $("status").textContent = ""; }, 1200); }
+  catch { $("status").textContent = "Impossible de copier."; }
 };
 $("clear").onclick = () => { $("md").value = ""; $("meta").value = ""; $("download").style.display = "none"; updateCounters(); $("status").textContent = "Zones effacées."; setTimeout(() => { $("status").textContent = ""; }, 1200); };
 
@@ -963,8 +978,8 @@ async def convert(
 ):
     """
     - Plugins OFF : MarkItDown simple (+ cleanup).
-    - Plugins ON (PDF) : pipeline inline (texte vectoriel + OCR images), avec 'force_ocr' qui assouplit l'acceptation.
-    - Image seule : OCR + base64 si OCR pauvre.
+    - Plugins ON (PDF) : pipeline inline (texte vectoriel + OCR images + PPStructure), avec 'force_ocr' qui assouplit l'acceptation.
+    - Image seule : OCR/PPStructure + base64 si OCR pauvre.
     """
     try:
         t_start = time.perf_counter()
@@ -973,7 +988,6 @@ async def convert(
         if not content:
             raise HTTPException(status_code=400, detail="Fichier vide")
 
-        # Sauvegarde du fichier source
         in_path = None
         if SAVE_UPLOADS:
             in_path = os.path.join(UPLOAD_DIR, file.filename)
@@ -983,7 +997,6 @@ async def convert(
         is_pdf = guess_is_pdf(file.filename, file.content_type)
         is_img = guess_is_image(file.filename, file.content_type)
 
-        # Sélection du mode
         selected_mode = (mode or PROCESSING_MODE).lower()
         if selected_mode not in ALLOWED_MODES:
             selected_mode = "quality"
@@ -991,7 +1004,6 @@ async def convert(
         metadata: Dict[str, Any] = {"processing_mode": selected_mode}
 
         if is_pdf and use_plugins and OCR_ENABLED:
-            # Pipeline inline pour PDF + plugins ON
             ocr_meta: Dict[str, Any] = {}
             markdown, meta_pdf = render_pdf_markdown_inline(
                 content,
@@ -1007,19 +1019,15 @@ async def convert(
             markdown = _md_cleanup(markdown)
 
         else:
-            # Conversion MarkItDown générique
             md_engine = MarkItDown(enable_plugins=use_plugins)
             result = md_engine.convert_stream(io.BytesIO(content), file_name=file.filename)
-
             markdown = getattr(result, "text_content", "") or ""
             metadata.update(getattr(result, "metadata", {}) or {})
             warnings = getattr(result, "warnings", None)
             if warnings:
                 metadata["warnings"] = warnings
-
             markdown = _md_cleanup(markdown)
 
-            # Image isolée + OCR (Paddle)
             if OCR_ENABLED and is_img:
                 try:
                     ocr_text, score, used_lang = ocr_image_bytes(content, selected_mode)
@@ -1045,7 +1053,6 @@ async def convert(
                         except Exception:
                             pass
 
-        # Sauvegarde résultat
         out_name = f"{os.path.splitext(file.filename)[0]}.md"
         out_path = None
         if SAVE_OUTPUTS:
@@ -1053,7 +1060,6 @@ async def convert(
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(markdown)
 
-        # Durée
         metadata["duration_sec"] = round(time.perf_counter() - t_start, 3)
         if SAVE_UPLOADS and in_path:
             metadata["saved_input_path"] = in_path
