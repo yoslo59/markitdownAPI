@@ -2,10 +2,9 @@ FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    tesseract-ocr \
-    tesseract-ocr-fra \
-    tesseract-ocr-eng \
     curl \
+    libgl1 \
+    libglib2.0-0 \
  && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
@@ -13,12 +12,12 @@ RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     python-multipart \
-    openai \
     pymupdf \
-    pytesseract \
     pillow \
     opencv-python-headless \
-    pandas
+    pandas \
+    paddlepaddle \
+    paddleocr
 
 WORKDIR /app
 COPY main.py /app/main.py
