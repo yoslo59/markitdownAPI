@@ -15,7 +15,8 @@ from markitdown import MarkItDown
 
 # OCR & Images
 import numpy as np
-from paddleocr import PaddleOCR, PPStructure
+from paddleocr import PaddleOCR
+from paddleocr import PPStructureV3 as PPStructure
 from PIL import Image, ImageOps, ImageFilter
 import fitz  # PyMuPDF
 from html.parser import HTMLParser
