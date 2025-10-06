@@ -63,7 +63,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="4.0-paddleocr+modes-noazure")
+app = FastAPI(title="MarkItDown API", version="4.1-paddleocr+modes-noazure")
 
 app.add_middleware(
     CORSMiddleware,
@@ -139,24 +139,12 @@ def _ocr_quality_score(txt: str) -> float:
     return max(0.0, min(1.0, 0.5 * alnum_ratio + 0.5 * min(1.0, n/600) + 0.02 * len(words)))
 
 def _build_paddle(mode: str) -> PaddleOCR:
-    if mode == "quality":
-        return PaddleOCR(
-            use_angle_cls=True,
-            lang=OCR_LANG,
-            det=True, rec=True,
-            rec_batch_num=6,
-            det_db_box_thresh=0.3,
-            det_limit_side_len=1536,
-        )
-    else:
-        return PaddleOCR(
-            use_angle_cls=False,
-            lang=OCR_LANG,
-            det=True, rec=True,
-            rec_batch_num=16,
-            det_db_box_thresh=0.5,
-            det_limit_side_len=960,
-        )
+    # Version compatible: pas d'arguments 'det', 'rec', etc.
+    return PaddleOCR(
+        use_angle_cls=(mode == "quality"),
+        lang=OCR_LANG,
+        show_log=False,
+    )
 
 _PADDLE_INSTANCES: Dict[str, PaddleOCR] = {}
 
@@ -166,32 +154,29 @@ def _get_ocr(mode: str) -> PaddleOCR:
     return _PADDLE_INSTANCES[mode]
 
 def _paddle_ocr_text(im: Image.Image, mode: str) -> Tuple[str, float]:
-    try:
-        if im.mode not in ("RGB", "L"):
-            im = im.convert("RGB")
-        if mode == "quality":
-            im = _preprocess_for_ocr(im)
-        ocr = _get_ocr(mode)
-        img_nd = np.array(im)  # PIL -> numpy
-        res = ocr.ocr(img_nd)
+    if im.mode not in ("RGB", "L"):
+        im = im.convert("RGB")
+    if mode == "quality":
+        im = _preprocess_for_ocr(im)
+    ocr = _get_ocr(mode)
+    img_nd = np.array(im)  # PIL -> numpy
+    # Appel compatible: uniquement cls=...
+    res = ocr.ocr(img_nd, cls=(mode == "quality"))
 
-        lines = []
-        if res and isinstance(res, list):
-            for page in res:
-                if not page:
+    lines = []
+    if res and isinstance(res, list):
+        for page in res:
+            if not page:
+                continue
+            for det in page:
+                try:
+                    txt = det[1][0]
+                    if txt:
+                        lines.append(txt)
+                except Exception:
                     continue
-                for det in page:
-                    try:
-                        txt = det[1][0]
-                        if txt:
-                            lines.append(txt)
-                    except Exception:
-                        continue
-        text = "\n".join(lines).strip()
-        return text, _ocr_quality_score(text)
-    except Exception:
-        # Laisse l'appelant gérer le fallback; remonte une exception détaillée
-        raise
+    text = "\n".join(lines).strip()
+    return text, _ocr_quality_score(text)
 
 def _fast_has_text_with_paddle(im: Image.Image, mode: str, min_words: int) -> bool:
     try:
@@ -314,7 +299,12 @@ def _wrap_tables_as_code(txt: str) -> str:
         out.extend(buf); out.append("```")
     return "\n".join(out)
 
-def render_pdf_markdown_inline(pdf_bytes: bytes, mode: str, meta_out: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+def render_pdf_markdown_inline(
+    pdf_bytes: bytes,
+    mode: str,
+    meta_out: Dict[str, Any],
+    force_ocr_images: bool = False
+) -> Tuple[str, Dict[str, Any]]:
     # DPI/mode
     if mode == "fast":
         dpi_page = min(OCR_DPI, 300)
@@ -391,12 +381,15 @@ def render_pdf_markdown_inline(pdf_bytes: bytes, mode: str, meta_out: Dict[str, 
                     continue
 
                 # Décision d'OCR
-                if IMAGE_OCR_MODE == "never":
-                    do_img_ocr = False
-                elif IMAGE_OCR_MODE == "smart":
-                    do_img_ocr = _fast_has_text_with_paddle(im, mode, IMAGE_OCR_MIN_WORDS)
-                else:  # always | conservative | autre
+                if force_ocr_images:
                     do_img_ocr = True
+                else:
+                    if IMAGE_OCR_MODE == "never":
+                        do_img_ocr = False
+                    elif IMAGE_OCR_MODE == "smart":
+                        do_img_ocr = _fast_has_text_with_paddle(im, mode, IMAGE_OCR_MIN_WORDS)
+                    else:  # always | conservative
+                        do_img_ocr = True
 
                 md_img = ""
                 txt, q = "", 0.0
@@ -408,7 +401,10 @@ def render_pdf_markdown_inline(pdf_bytes: bytes, mode: str, meta_out: Dict[str, 
                             f"img_page_{p+1}: {type(e).__name__}: {e}"
                         )
 
-                if txt and q >= OCR_TEXT_QUALITY_MIN:
+                # Si on force l'OCR, on accepte du texte même un peu faible
+                accept_low_quality = force_ocr_images and txt and len(txt) >= 10
+
+                if (txt and q >= OCR_TEXT_QUALITY_MIN) or accept_low_quality:
                     md_img = _classify_ocr_block(txt.strip())
                 else:
                     if EMBED_IMAGES in ("all", "ocr_only"):
@@ -493,7 +489,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes, mode: str, meta_out: Dict[str, 
         doc.close()
 
 # ---------------------------
-# UI web (sans Azure/DI)
+# UI web (sans Azure/LLM)
 # ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
@@ -556,7 +552,7 @@ HTML_PAGE = r'''<!doctype html>
     }
     textarea{
       width:100%;
-      min_height:280px;
+      min-height:280px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
       font-size:.95rem;
       resize: vertical;
@@ -670,6 +666,7 @@ HTML_PAGE = r'''<!doctype html>
 const $ = (id) => document.getElementById(id);
 const endpoint = "/convert";
 
+// drag & drop + meta
 (function(){
   const dz = $("dropzone"), fi = $("file"), fm = $("filemeta");
   function prettySize(bytes){ if(bytes < 1024) return bytes + " B"; if(bytes < 1048576) return (bytes/1024).toFixed(1) + " KB"; return (bytes/1048576).toFixed(1) + " MB"; }
@@ -681,6 +678,7 @@ const endpoint = "/convert";
   fi.addEventListener("change", () => showMeta(fi.files[0]));
 })();
 
+// Timer + counters
 let timerId = null, t0 = 0;
 function startTimer(){ stopTimer(); t0 = performance.now(); timerId = setInterval(() => { const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); }, 100); }
 function stopTimer(final = false){ if(timerId){ clearInterval(timerId); timerId = null; } if(final){ const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); } }
@@ -704,6 +702,7 @@ $("clear").onclick = () => {
   setTimeout(() => { $("status").textContent = ""; }, 1200); 
 };
 
+// Convertir le document
 $("convert").onclick = async () => {
   const f = $("file").files[0];
   if(!f){ alert("Choisissez un fichier."); return; }
@@ -719,7 +718,8 @@ $("convert").onclick = async () => {
   fd.append("file", f);
   fd.append("use_plugins", $("plugins").checked ? "true" : "false");
   fd.append("force_ocr", $("forceocr").checked ? "true" : "false");
-  // fd.append("mode", "fast"); // ou "quality" pour override
+  // Pour surcharger le mode côté serveur, décommentez:
+  // fd.append("mode", "fast");  // ou "quality"
 
   try {
     const res = await fetch(endpoint, { method: "POST", body: fd });
@@ -792,9 +792,11 @@ async def convert(
         metadata: Dict[str, Any] = {"processing_mode": selected_mode}
 
         if is_pdf and use_plugins and OCR_ENABLED and force_ocr:
-            # ✅ Corrigé : on ne force plus OCR tout le temps
+            # Pipeline PDF inline : texte + OCR images (+ fallback page)
             ocr_meta: Dict[str, Any] = {}
-            markdown, meta_pdf = render_pdf_markdown_inline(content, selected_mode, ocr_meta)
+            markdown, meta_pdf = render_pdf_markdown_inline(
+                content, selected_mode, ocr_meta, force_ocr_images=True
+            )
             metadata.update(meta_pdf)
             if ocr_meta:
                 metadata.update(ocr_meta)
@@ -827,7 +829,7 @@ async def convert(
                             markdown += f'\n\n![{IMG_ALT_PREFIX}]({data_uri})\n'
                 except Exception as e:
                     metadata.setdefault("ocr_errors", []).append(f"image: {type(e).__name__}: {e}")
-                    # Fallback : on embarque l'image si demandé
+                    # Fallback : embarquer l'image si demandé
                     if EMBED_IMAGES in ("all", "ocr_only"):
                         try:
                             with Image.open(io.BytesIO(content)) as im:
@@ -862,7 +864,6 @@ async def convert(
     except HTTPException:
         raise
     except Exception as e:
-        # remonte le détail côté client pour debug rapide
         detail = f"Conversion error: {type(e).__name__}: {e}"
         trace = traceback.format_exc(limit=3)
         raise HTTPException(status_code=500, detail=f"{detail}\n{trace}")
