@@ -42,6 +42,7 @@ OCR_DPI_CANDIDATES = [int(x) for x in os.getenv("OCR_DPI_CANDIDATES", "300,350,4
 OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
 
 # Politique OCR images & fallback
+# NOTE: en mode "plugins ON", on force "always" en pratique (comme Marker)
 IMAGE_OCR_MODE = os.getenv("IMAGE_OCR_MODE", "smart").strip()  # smart | conservative | always | never
 IMAGE_OCR_MIN_WORDS = int(os.getenv("IMAGE_OCR_MIN_WORDS", "10"))
 OCR_TEXT_QUALITY_MIN = float(os.getenv("OCR_TEXT_QUALITY_MIN", "0.30"))
@@ -63,7 +64,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="4.3-inline-ocr-default+paddle")
+app = FastAPI(title="MarkItDown API", version="4.6-inline-ocr-titles-tables+paddle")
 
 app.add_middleware(
     CORSMiddleware,
@@ -267,14 +268,15 @@ def crop_bbox_image(page: fitz.Page, bbox: Tuple[float, float, float, float], dp
         return None
 
 def _hash_image_for_dedup(im: Image.Image) -> str:
-    # hash rapide pour dédupliquer des embeds
-    small = im.resize((min(256, im.width), max(1, int(im.height * min(256, im.width) / max(1, im.width)))), Image.BILINEAR)
+    small_w = min(256, im.width)
+    small_h = max(1, int(im.height * small_w / max(1, im.width)))
+    small = im.resize((small_w, small_h), Image.BILINEAR)
     buf = io.BytesIO()
     small.save(buf, format="PNG")
     return hashlib.md5(buf.getvalue()).hexdigest()
 
 # ---------------------------
-# PDF inline : texte + images (OCR smart) + fallback
+# PDF inline : texte + images (OCR smart) + fallback + tables
 # ---------------------------
 def _is_bold(flags: int) -> bool:
     return bool(flags & 1 or flags & 32)
@@ -294,11 +296,13 @@ def _median_font_size(page_raw: Dict[str, Any]) -> float:
     mid = len(sizes) // 2
     return sizes[mid] if len(sizes) % 2 == 1 else (sizes[mid-1] + sizes[mid]) / 2.0
 
-def _classify_heading(size: float, median_size: float) -> Optional[str]:
+def _classify_heading(size: float, median_size: float, has_bold: bool) -> Optional[str]:
     if median_size <= 0:
         return None
+    # Un peu plus agressif : si bold + > 1.1x médiane, on titre
     if size >= median_size * 1.8: return "#"
     if size >= median_size * 1.5: return "##"
+    if has_bold and size >= median_size * 1.1: return "###"
     if size >= median_size * 1.25: return "###"
     return None
 
@@ -307,17 +311,21 @@ _bullet_re = re.compile(r"^\s*(?:[-–—•·●◦▪]|\d+[.)])\s+")
 def _line_to_md(spans: List[Dict[str, Any]], median_size: float) -> str:
     parts = []
     max_size = 0.0
+    any_bold = False
     for sp in spans:
         t = sp.get("text", "")
         if not t:
             continue
         size = float(sp.get("size", 0))
         max_size = max(max_size, size)
-        parts.append(f"**{t}**" if _is_bold(int(sp.get("flags", 0))) else t)
+        bold = _is_bold(int(sp.get("flags", 0)))
+        any_bold = any_bold or bold
+        parts.append(f"**{t}**" if bold else t)
     raw = "".join(parts).strip()
     if not raw:
         return ""
-    h = _classify_heading(max_size, median_size)
+    # Titre ?
+    h = _classify_heading(max_size, median_size, any_bold)
     if h and len(raw) < 180:
         return f"{h} {raw}"
     if _bullet_re.match(raw):
@@ -343,6 +351,25 @@ def _wrap_tables_as_code(txt: str) -> str:
         out.extend(buf); out.append("```")
     return "\n".join(out)
 
+def _band_is_table_row(cells: List[Tuple[float, float, str]], page_w: float) -> bool:
+    """
+    Heuristique : au moins 2 "cellules" dans la même bande, couvrant > 45% de la largeur,
+    avec un gap médian > 50 px → on considère une ligne de tableau (2–3 colonnes).
+    """
+    if len(cells) < 2 or len(cells) > 4:
+        return False
+    cells_sorted = sorted(cells, key=lambda c: c[0])
+    span = cells_sorted[-1][1] - cells_sorted[0][0]
+    if span < 0.45 * page_w:
+        return False
+    gaps = []
+    for i in range(len(cells_sorted) - 1):
+        gaps.append(cells_sorted[i+1][0] - cells_sorted[i][1])
+    if not gaps:
+        return False
+    gaps.sort()
+    return gaps[len(gaps)//2] > 50.0
+
 def render_pdf_markdown_inline(
     pdf_bytes: bytes,
     mode: str,
@@ -357,6 +384,9 @@ def render_pdf_markdown_inline(
         dpi_page = OCR_DPI
         dpi_candidates = OCR_DPI_CANDIDATES
 
+    # En "plugins ON", on se comporte comme Marker : OCR images "always"
+    img_ocr_policy = "always" if IMAGE_OCR_MODE != "never" else "never"
+
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     md_lines: List[str] = []
     meta: Dict[str, Any] = {"engine": f"pymupdf_inline+paddleocr({mode})", "pages": doc.page_count}
@@ -365,7 +395,6 @@ def render_pdf_markdown_inline(
         for p in range(total_pages):
             page = doc.load_page(p)
 
-            # IMPORTANT: utiliser "dict" (et non "rawdict")
             raw = page.get_text("dict") or {}
 
             median_size = _median_font_size(raw)
@@ -442,12 +471,12 @@ def render_pdf_markdown_inline(
                 area_ratio = a["area_ratio"]
                 is_background_like = area_ratio > 0.85
 
-                # Décision d'OCR
-                if IMAGE_OCR_MODE == "never":
+                # Politique d'OCR (always en plugins ON)
+                if img_ocr_policy == "never":
                     do_img_ocr = False
-                elif force_ocr_images or IMAGE_OCR_MODE in ("always", "conservative"):
+                elif force_ocr_images or img_ocr_policy in ("always", "conservative"):
                     do_img_ocr = True
-                else:  # smart
+                else:  # smart (non utilisé ici, mais on garde la branche)
                     do_img_ocr = _fast_has_text_with_paddle(im, mode, IMAGE_OCR_MIN_WORDS)
 
                 md_img = ""
@@ -507,35 +536,104 @@ def render_pdf_markdown_inline(
                 return (int(y_center / band_h), x0, y0)
             atoms.sort(key=sort_key)
 
-            # 4) Concaténation lignes + wrap tableaux
+            # 4) Concaténation lignes + détection de tableaux par bandes
             page_buf: List[str] = []
             para_buf: List[str] = []
             last_band = None
 
+            # Accumule les "cellules" d'une même bande pour décider table/texte
+            band_cells: List[Tuple[float, float, str]] = []
+            in_table = False
+            table_col_count = 0
+
             def flush_para():
+                nonlocal para_buf
                 if not para_buf:
                     return
-                block_txt = "\n".join(para_buf)
-                if _table_chars.search(block_txt):
-                    page_buf.append("```text"); page_buf.append(block_txt); page_buf.append("```")
-                else:
-                    page_buf.append(block_txt)
-                para_buf.clear()
+                block_txt = "\n".join(para_buf).strip()
+                if block_txt:
+                    if _table_chars.search(block_txt):
+                        page_buf.append("```text"); page_buf.append(block_txt); page_buf.append("```")
+                    else:
+                        page_buf.append(block_txt)
+                para_buf = []
+
+            def flush_table():
+                nonlocal in_table, table_col_count
+                if in_table:
+                    # Rien à faire : on ferme logiquement
+                    in_table = False
+                    table_col_count = 0
+
+            def start_table(cols: int):
+                nonlocal in_table, table_col_count
+                if not in_table:
+                    in_table = True
+                    table_col_count = cols
+                    # On n'a pas d'en-têtes fiables → entêtes neutres
+                    headers = " | ".join([f"Col {i+1}" for i in range(cols)])
+                    sep = " | ".join(["---"] * cols)
+                    page_buf.append(f"| {headers} |")
+                    page_buf.append(f"| {sep} |")
+
+            def emit_table_row(cells: List[Tuple[float, float, str]]):
+                cells_sorted = sorted(cells, key=lambda c: c[0])
+                row = [c[2].strip() for c in cells_sorted]
+                # normalisation pipes
+                row = [re.sub(r"\s*\|\s*", " ", c) for c in row]
+                page_buf.append("| " + " | ".join(row) + " |")
 
             for a in atoms:
                 x0, y0, x1, y1 = a["bbox"]
                 y_center = 0.5 * (y0 + y1)
                 band = int(y_center / band_h)
-                md = a["md"]
+
+                # changement de bande -> décider si la précédente forme une ligne de tableau
                 if last_band is not None and band != last_band:
-                    flush_para()
+                    if band_cells and _band_is_table_row(band_cells, page_w):
+                        # on était en texte ? on flush le paragraphe et on passe en "table"
+                        if not in_table:
+                            flush_para()
+                            start_table(cols=min(4, max(2, len(band_cells))))
+                        emit_table_row(band_cells)
+                    else:
+                        # bande non-table
+                        if in_table:
+                            flush_table()
+                        # pas de flush ici : les lignes textes restent dans para_buf
+                    band_cells = []
+
                 last_band = band
+
                 if a["kind"] == "text":
-                    para_buf.append(md)
+                    # Accumule pour éventuelle table
+                    band_cells.append((x0, x1, a["md"]))
+                    # Si on n'est pas en mode table, on garde aussi pour paragraphe
+                    if not in_table:
+                        para_buf.append(a["md"])
                 else:
+                    # image : couper paragraphe / table en cours
+                    if band_cells and _band_is_table_row(band_cells, page_w):
+                        if not in_table:
+                            flush_para()
+                            start_table(cols=min(4, max(2, len(band_cells))))
+                        emit_table_row(band_cells)
+                        band_cells = []
+                    if in_table:
+                        flush_table()
                     flush_para()
-                    page_buf.append(md)
-            flush_para()
+                    page_buf.append(a["md"])
+
+            # Fin de page : traiter la dernière bande
+            if band_cells and _band_is_table_row(band_cells, page_w):
+                if not in_table:
+                    flush_para()
+                    start_table(cols=min(4, max(2, len(band_cells))))
+                emit_table_row(band_cells)
+            else:
+                if in_table:
+                    flush_table()
+                flush_para()
 
             # 5) Fallback OCR page si rien d’extrait
             has_any_text = any(a.get("kind") == "text" for a in atoms) or \
@@ -576,7 +674,7 @@ def render_pdf_markdown_inline(
         doc.close()
 
 # ---------------------------
-# UI web (inchangée visuellement, sans Azure/LLM)
+# UI web (switch sliders rétablis + progress fixée)
 # ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
@@ -587,32 +685,132 @@ HTML_PAGE = r'''<!doctype html>
   <style>
     :root{
       color-scheme: dark;
-      --bg: #0b0f14; --bg2: #0e141b; --card: rgba(255,255,255,0.06); --card-border: rgba(255,255,255,0.08);
-      --text: #e6edf3; --muted: #9fb0bf; --accent: #63b3ff; --accent-2: #8f7aff; --radius: 16px;
+      --bg: #0b0f14;
+      --bg2: #0e141b;
+      --card: rgba(255,255,255,0.06);
+      --card-border: rgba(255,255,255,0.08);
+      --text: #e6edf3;
+      --muted: #9fb0bf;
+      --accent: #63b3ff;
+      --accent-2: #8f7aff;
+      --radius: 16px;
     }
     *{box-sizing:border-box}
-    body{margin:0; font-family: ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;
-      color:var(--text); background:radial-gradient(1000px 600px at 20% -10%, #183a58 0%, transparent 60%),
-                         radial-gradient(900px 500px at 120% 10%, #3b2d6a 0%, transparent 55%),
-                         linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%); background-attachment: fixed;
-      line-height:1.55; padding:32px 20px 40px;}
-    h1{margin:0 0 .35rem 0; font-size:1.65rem}
+    html,body{height:100%}
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      color:var(--text);
+      background:
+        radial-gradient(1000px 600px at 20% -10%, #183a58 0%, transparent 60%),
+        radial-gradient(900px 500px at 120% 10%, #3b2d6a 0%, transparent 55%),
+        linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
+      background-attachment: fixed;
+      line-height:1.55;
+      padding:32px 20px 40px;
+    }
+    h1{margin:0 0 .35rem 0; font-size:1.65rem; letter-spacing:.2px}
+    .sub{color:var(--muted); font-size:.95rem; margin-bottom:18px}
     .container{max-width:1060px; margin:0 auto}
-    .card{background:var(--card); border:1px solid var(--card-border); border-radius:var(--radius); padding:18px; margin-top:16px; backdrop-filter: blur(8px);}
+    .card{
+      background:var(--card);
+      border:1px solid var(--card-border);
+      border-radius:var(--radius);
+      padding:18px;
+      margin-top:16px;
+      backdrop-filter: blur(8px);
+    }
     .row{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
     label{font-weight:600}
-    input[type="file"], textarea{background:rgba(255,255,255,0.03); color:var(--text); border:1px solid rgba(255,255,255,0.12);
-      border-radius:12px; padding:10px 12px; outline:none; transition:border .15s ease, box-shadow .15s ease;}
-    textarea{width:100%; min-height:280px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size:.95rem; resize: vertical;}
-    button{padding:10px 16px; border-radius:12px; border:1px solid rgba(255,255,255,0.12); color:#0b0f14;
-      background: linear-gradient(135deg, var(--accent), var(--accent-2)); cursor:pointer; font-weight:700}
-    a#download{display:inline-flex; align-items:center; gap:8px; padding:10px 16px; border-radius:12px; border:1px solid rgba(255,255,255,0.16); text-decoration:none; color:var(--text); background:rgba(255,255,255,0.03)}
-    .drop{border:1.5px dashed rgba(255,255,255,0.18); border-radius:14px; padding:18px; text-align:center; cursor:pointer; transition:.15s; background:rgba(255,255,255,0.02)}
-    .drop:hover{border-color:rgba(255,255,255,0.35)} .drop.active{border-color:var(--accent); background:rgba(99,179,255,.06)}
+    input[type="text"], input[type="file"], textarea{
+      background:rgba(255,255,255,0.03);
+      color:var(--text);
+      border:1px solid rgba(255,255,255,0.12);
+      border-radius:12px;
+      padding:10px 12px;
+      outline:none;
+      transition:border .15s ease, box-shadow .15s ease;
+    }
+    textarea{
+      width:100%;
+      min-height:280px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size:.95rem;
+      resize: vertical;
+    }
+    button{
+      padding:10px 16px;
+      border-radius:12px;
+      border:1px solid rgba(255,255,255,0.12);
+      color:#0b0f14;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      cursor:pointer;
+      font-weight:700;
+      letter-spacing:.2px;
+      transition:transform .06s ease, filter .15s ease, opacity .2s ease;
+    }
+    button:hover{ filter:brightness(1.08) }
+    button:active{ transform:translateY(1px) }
+    button:disabled{ opacity:.55; cursor:not-allowed; filter:none }
+    .btn-ghost{
+      background:transparent;
+      color:var(--text);
+      border-color:rgba(255,255,255,0.16);
+    }
+    a#download{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:10px 16px; border-radius:12px;
+      border:1px solid rgba(255,255,255,0.16);
+      text-decoration:none; color:var(--text);
+      background:rgba(255,255,255,0.03);
+    }
+    .muted{color:var(--muted)}
+
+    /* Dropzone */
+    .drop{
+      border:1.5px dashed rgba(255,255,255,0.18);
+      border-radius:14px;
+      padding:18px;
+      text-align:center;
+      cursor:pointer;
+      transition:.15s border-color ease, background .15s ease;
+      background:rgba(255,255,255,0.02);
+      width:100%;
+    }
+    .drop:hover{border-color:rgba(255,255,255,0.35)}
+    .drop.active{border-color:var(--accent); background:rgba(99,179,255,.06)}
+
+    .filemeta{font-size:.95rem; color:var(--text); opacity:.9}
+
+    /* Switches (sliders) */
+    .switch{position:relative; display:inline-block; width:44px; height:24px}
+    .switch input{opacity:0; width:0; height:0}
+    .slider{
+      position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0;
+      background:rgba(255,255,255,0.12); transition:.2s; border-radius:999px; border:1px solid rgba(255,255,255,0.2);
+    }
+    .slider:before{
+      position:absolute; content:""; height:18px; width:18px; left:2px; top:2.5px;
+      background:white; transition:.2s; border-radius:50%;
+    }
+    .switch input:checked + .slider{
+      background:linear-gradient(135deg, var(--accent), var(--accent-2));
+      border-color:transparent;
+    }
+    .switch input:checked + .slider:before{ transform:translateX(20px) }
+
     .progress{height:10px; background:rgba(255,255,255,0.08); border-radius:999px; overflow:hidden; display:none; margin-top:10px}
     .bar{height:100%; width:40%; background:linear-gradient(135deg, var(--accent), var(--accent-2)); border-radius:999px; animation:slide 1.2s infinite}
+    @keyframes slide{0%{transform:translateX(-100%)}50%{transform:translateX(50%)}100%{transform:translateX(150%)}}
+
     .stats{display:flex; gap:12px; align-items:center; margin-top:10px; flex-wrap:wrap}
-    .tag{display:inline-flex; gap:6px; align-items:center; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); border-radius:999px; padding:6px 10px; font-size:.9rem}
+    .tag{
+      display:inline-flex; gap:6px; align-items:center;
+      background:rgba(255,255,255,0.05);
+      border:1px solid rgba(255,255,255,0.15);
+      border-radius:999px; padding:6px 10px; font-size:.9rem
+    }
+    .tag b{font-weight:800}
   </style>
 </head>
 <body>
@@ -629,14 +827,22 @@ HTML_PAGE = r'''<!doctype html>
         <div class="filemeta" id="filemeta"></div>
       </div>
 
-      <div class="drop" id="dropzone" tabindex="0">Glissez-déposez votre fichier ici (ou utilisez le champ ci-dessus)</div>
+      <div class="drop" id="dropzone" tabindex="0" aria-label="Déposez un fichier ici">
+        Glissez-déposez votre fichier ici (ou utilisez le champ ci-dessus)
+      </div>
 
       <div class="row" style="margin-top:12px">
         <label for="plugins">Activer plugins MarkItDown</label>
-        <label class="switch"><input id="plugins" type="checkbox" /><span class="slider"></span></label>
+        <label class="switch">
+          <input id="plugins" type="checkbox" />
+          <span class="slider"></span>
+        </label>
 
         <label for="forceocr">Forcer OCR</label>
-        <label class="switch"><input id="forceocr" type="checkbox" /><span class="slider"></span></label>
+        <label class="switch">
+          <input id="forceocr" type="checkbox" />
+          <span class="slider"></span>
+        </label>
       </div>
 
       <div class="row" style="margin-top:12px; gap:10px">
@@ -686,16 +892,25 @@ const endpoint = "/convert";
 // Timer + counters
 let timerId = null, t0 = 0;
 function startTimer(){ stopTimer(); t0 = performance.now(); timerId = setInterval(() => { const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); }, 100); }
-function stopTimer(final = false){ if(timerId){ clearInterval(timerId); timerId = null; } if(final){ const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.to  .toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); } }
+function stopTimer(final = false){ if(timerId){ clearInterval(timerId); timerId = null; } if(final){ const dt = (performance.now() - t0) / 1000; $("timer").textContent = dt < 60 ? dt.toFixed(2) + " s" : (Math.floor(dt/60) + "m " + (dt % 60).toFixed(1) + "s"); } }
 function updateCounters(){ const txt = $("md").value || ""; $("charcount").textContent = txt.length.toString(); $("linecount").textContent = (txt ? txt.split(/\r?\n/).length : 0).toString(); }
-$("copy").onclick = async () => { try { await navigator.clipboard.writeText($("md").value || ""); $("status").textContent = "Markdown copié"; setTimeout(() => { $("status").textContent = ""; }, 1200); } catch { $("status").textContent = "Impossible de copier."; } };
+$("copy").onclick = async () => { 
+  try { await navigator.clipboard.writeText($("md").value || ""); $("status").textContent = "Markdown copié"; setTimeout(() => { $("status").textContent = ""; }, 1200); } 
+  catch { $("status").textContent = "Impossible de copier."; } 
+};
 $("clear").onclick = () => { $("md").value = ""; $("meta").value = ""; $("download").style.display = "none"; updateCounters(); $("status").textContent = "Zones effacées."; setTimeout(() => { $("status").textContent = ""; }, 1200); };
 
 // Convertir
 $("convert").onclick = async () => {
   const f = $("file").files[0];
   if(!f){ alert("Choisissez un fichier."); return; }
-  $("convert").disabled = true; $("status").textContent = "Conversion en cours..."; $("md").value = ""; $("meta").value = ""; $("download").style.display = "none"; $("progress").style.display = "block"; startTimer();
+  $("convert").disabled = true;
+  $("status").textContent = "Conversion en cours...";
+  $("md").value = "";
+  $("meta").value = "";
+  $("download").style.display = "none";
+  $("progress").style.display = "block";
+  startTimer();
 
   const fd = new FormData();
   fd.append("file", f);
@@ -708,16 +923,24 @@ $("convert").onclick = async () => {
     const json = await res.json();
     $("md").value = json.markdown || "";
     $("meta").value = JSON.stringify(json.metadata || {}, null, 2);
+    updateCounters();
+
     const blob = new Blob([$("md").value], { type: "text/markdown;charset=utf-8" });
-    const url  = URL.createObjectURL(blob); const a = $("download");
-    a.href = url; a.download = (json.output_filename || "sortie.md"); a.style.display = "inline-flex";
+    const url  = URL.createObjectURL(blob);
+    const a = $("download");
+    a.href = url;
+    a.download = (json.output_filename || "sortie.md");
+    a.style.display = "inline-flex";
     $("status").textContent = "OK";
   } catch(e) {
     $("status").textContent = "Erreur : " + (e && e.message ? e.message : e);
   } finally {
-    $("convert").disabled = false; $("progress").style.display = "none"; stopTimer(true);
+    $("convert").disabled = false;
+    $("progress").style.display = "none";
+    stopTimer(true);
   }
 };
+
 $("md").addEventListener("input", updateCounters);
 </script>
 </body>
@@ -742,7 +965,6 @@ async def convert(
     - Plugins OFF : MarkItDown simple (+ cleanup).
     - Plugins ON (PDF) : pipeline inline (texte vectoriel + OCR images), avec 'force_ocr' qui assouplit l'acceptation.
     - Image seule : OCR + base64 si OCR pauvre.
-    - Modes : 'quality' (défaut) ou 'fast'.
     """
     try:
         t_start = time.perf_counter()
@@ -769,7 +991,7 @@ async def convert(
         metadata: Dict[str, Any] = {"processing_mode": selected_mode}
 
         if is_pdf and use_plugins and OCR_ENABLED:
-            # TOUJOURS le pipeline inline pour PDF + plugins ON
+            # Pipeline inline pour PDF + plugins ON
             ocr_meta: Dict[str, Any] = {}
             markdown, meta_pdf = render_pdf_markdown_inline(
                 content,
