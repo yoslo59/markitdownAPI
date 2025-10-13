@@ -60,7 +60,7 @@ IMG_MAX_WIDTH      = int(os.getenv("IMG_MAX_WIDTH", "1600"))
 IMG_ALT_PREFIX     = os.getenv("IMG_ALT_PREFIX", "Capture").strip()
 EMBED_SKIP_BG_IF_TEXT = os.getenv("EMBED_SKIP_BG_IF_TEXT", "true").lower() == "true"
 
-# Dossiers persistants
+# Dossiers persistents
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -115,7 +115,7 @@ _table_chars = re.compile(r"[|+\-=_]{3,}")
 def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
     g = ImageOps.grayscale(im)
     g = ImageOps.autocontrast(g, cutoff=1)
-    g = g.filter(ImageFilter.MedianFilter(size=3))
+    g = im.filter(ImageFilter.MedianFilter(size=3))
     return g
 
 def _classify_ocr_block(txt: str) -> str:
@@ -151,7 +151,7 @@ def _parse_langs(raw: str) -> List[str]:
         elif p in ("deu", "ger", "german"): out.append("german")
         elif p in ("spa", "es", "spanish"): out.append("latin")
         else: out.append(p)
-    seen=set(); unique=[]
+    seen = set(); unique = []
     for l in out:
         if l not in seen:
             unique.append(l); seen.add(l)
@@ -180,7 +180,7 @@ def _get_table_engine(mode: str) -> PPStructure:
     # PPStructure: on reste sur 'en' (latin) pour la structure/table.
     key = f"ppstruct:{mode}"
     if key not in _PPSTRUCT_INSTANCES:
-        _PPSTRUCT_INSTANCES[key] = PPStructure(show_log=False, lang='en')  # télécharge modèles au 1er run
+        _PPSTRUCT_INSTANCES[key] = PPStructure(show_log=False, lang='en')
     return _PPSTRUCT_INSTANCES[key]
 
 def _paddle_ocr_text_best(im: Image.Image, mode: str, langs: Optional[List[str]] = None) -> Tuple[str, float, str]:
@@ -226,9 +226,9 @@ def _ppstruct_tables_to_md(img: Image.Image) -> Optional[str]:
     Retourne du Markdown (sans texte hors-table), ou None si pas de table.
     """
     try:
-        engine = _get_table_engine("quality")  # structure moins sensible au mode
+        engine = _get_table_engine("quality")
         nd = np.array(img.convert("RGB"))
-        result = engine(nd)  # liste d'éléments: type in {'table','text','title','figure'}
+        result = engine(nd)
         tables_md: List[str] = []
         for item in result:
             if item.get('type') != 'table':
@@ -276,13 +276,13 @@ class _TableHTMLParser(HTMLParser):
         t = tag.lower()
         if t in ("td", "th") and self.in_cell:
             txt = html.unescape("".join(self.buf)).strip()
-            txt = re.sub(r"\s*\|\s*", " ", txt)  # éviter les pipes qui cassent le markdown
+            txt = re.sub(r"\s*\|\s*", " ", txt)
             self.current_row.append(txt)
             self.in_cell = False
             self.is_th = False
         elif t == "tr" and self.in_tr:
             if self.current_row:
-                # s'il y a une ligne d'en-têtes évidente (th) PP-Structure l'a déjà mise au début
+                # s'il y a une ligne d'en-têtes évidente (th), PP-Structure l'a déjà mise au début
                 self.rows.append(self.current_row)
             self.in_tr = False
         elif t == "table":
@@ -534,7 +534,8 @@ def render_pdf_markdown_inline(
 
             for a in atoms:
                 if a["kind"] != "image_raw":
-                    processed.append(a); continue
+                    processed.append(a)
+                    continue
 
                 im = crop_bbox_image(page, a["bbox"], dpi_page)
                 if im is None:
@@ -632,7 +633,9 @@ def render_pdf_markdown_inline(
                 block_txt = "\n".join(para_buf).strip()
                 if block_txt:
                     if _table_chars.search(block_txt):
-                        page_buf.append("```text"); page_buf.append(block_txt); page_buf.append("```")
+                        page_buf.append("```text")
+                        page_buf.append(block_txt)
+                        page_buf.append("```")
                     else:
                         page_buf.append(block_txt)
                 para_buf.clear()
@@ -680,6 +683,32 @@ def render_pdf_markdown_inline(
             if page_buf:
                 md_lines.append("\n\n".join(page_buf))
 
+        # Suppression des en-têtes/pieds de page répétés
+        if len(md_lines) > 1:
+            first_lines: List[str] = []
+            last_lines: List[str] = []
+            for content in md_lines:
+                lines = [l for l in content.splitlines() if l.strip()]
+                if not lines:
+                    continue
+                first_lines.append(lines[0])
+                last_lines.append(lines[-1])
+            header_counts: Dict[str, int] = {}
+            footer_counts: Dict[str, int] = {}
+            for line in first_lines:
+                header_counts[line] = header_counts.get(line, 0) + 1
+            for line in last_lines:
+                footer_counts[line] = footer_counts.get(line, 0) + 1
+            headers_to_remove = {line for line, count in header_counts.items() if count >= 2 and count >= 0.5 * len(md_lines)}
+            footers_to_remove = {line for line, count in footer_counts.items() if count >= 2 and count >= 0.5 * len(md_lines)}
+            for i, content in enumerate(md_lines):
+                lines = content.splitlines()
+                if lines and lines[0].strip() and lines[0] in headers_to_remove:
+                    lines = lines[1:]
+                if lines and lines[-1].strip() and lines[-1] in footers_to_remove:
+                    lines = lines[:-1]
+                md_lines[i] = "\n".join(lines).strip()
+
         final_md = "\n\n".join([l for l in md_lines if l.strip()]).strip()
 
         if "ocr_used_langs" in meta_out and isinstance(meta_out["ocr_used_langs"], set):
@@ -689,9 +718,6 @@ def render_pdf_markdown_inline(
     finally:
         doc.close()
 
-# ---------------------------
-# UI web (sliders + progress OK)
-# ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
 <head>
