@@ -235,7 +235,159 @@ def _ppstruct_tables_to_md(img: Image.Image) -> Optional[str]:
                 continue
             res = item.get('res', {})
             html_str = res.get('html', '')
-            md = _html_table_to_markdown(html_str)
+            md = _html_table_to_markdown
+class _ImgStripper(HTMLParser):
+    """
+    Rebuilds HTML while replacing <img> tags with placeholders, and records their attributes.
+    Produces a sanitized HTML string preserving order, with tokens like <<<MDIMG_0>>>.
+    """
+    def __init__(self):
+        super().__init__()
+        self.out = []
+        self.images = []  # list of dicts: {src, alt, width, height}
+    def handle_starttag(self, tag, attrs):
+        t = tag.lower()
+        if t == "img":
+            d = {k.lower(): (v or "") for k,v in attrs}
+            self.images.append({
+                "src": d.get("src",""),
+                "alt": d.get("alt","").strip(),
+                "width": d.get("width",""),
+                "height": d.get("height","")
+            })
+            self.out.append(f"<<<MDIMG_{len(self.images)-1}>>>")
+        else:
+            # rebuild the tag
+            self.out.append("<" + t)
+            for k,v in attrs:
+                if v is None: v = ""
+                self.out.append(f' {k}="{html.escape(v, quote=True)}"')
+            self.out.append(">")
+    def handle_startendtag(self, tag, attrs):
+        t = tag.lower()
+        if t == "img":
+            d = {k.lower(): (v or "") for k,v in attrs}
+            self.images.append({
+                "src": d.get("src",""),
+                "alt": d.get("alt","").strip(),
+                "width": d.get("width",""),
+                "height": d.get("height","")
+            })
+            self.out.append(f"<<<MDIMG_{len(self.images)-1}>>>")
+        else:
+            self.out.append("<" + t)
+            for k,v in attrs:
+                if v is None: v = ""
+                self.out.append(f' {k}="{html.escape(v, quote=True)}"')
+            self.out.append(" />")
+    def handle_endtag(self, tag):
+        t = tag.lower()
+        if t != "img":
+            self.out.append(f"</{t}>")
+    def handle_data(self, data):
+        self.out.append(data)
+    def get_html(self):
+        return "".join(self.out)
+
+def _data_uri_to_bytes(data_uri: str) -> tuple[bytes, str] | tuple[None, None]:
+    try:
+        if not data_uri.startswith("data:"):
+            return None, None
+        header, b64 = data_uri.split(",", 1)
+        mime = "image/png"
+        if ";base64" in header:
+            # extract mime like data:image/png;base64
+            if ":" in header and ";" in header:
+                mime = header.split(":")[1].split(";")[0] or mime
+            raw = base64.b64decode(b64)
+            return raw, mime
+        return None, None
+    except Exception:
+        return None, None
+
+def _convert_html_with_inline_images(html_bytes: bytes, use_plugins: bool, img_fmt: str, img_quality: int, img_max_w: int, alt_prefix: str) -> tuple[str, dict]:
+    # Decode
+    try:
+        html_txt = html_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        html_txt = html_bytes.decode("latin-1", errors="ignore")
+
+    # Replace <img> with tokens
+    stripper = _ImgStripper()
+    stripper.feed(html_txt)
+    stripped_html = stripper.get_html()
+    imgs = stripper.images
+
+    # Convert text via MarkItDown (on sanitized HTML without <img> tags)
+    md_engine = MarkItDown(enable_plugins=use_plugins)
+    result = md_engine.convert(stripped_html, "text/html")
+    md = getattr(result, "text_content", "") or ""
+    meta = getattr(result, "metadata", {}) or {}
+    warns = getattr(result, "warnings", None)
+    if warns:
+        meta["warnings"] = warns
+
+    # Build md for each image token
+    embedded = 0
+    skipped = 0
+    processed = {}
+    for i, info in enumerate(imgs):
+        src = info.get("src","").strip()
+        alt = info.get("alt","").strip() or alt_prefix
+        token = f"<<<MDIMG_{i}>>>"
+        md_img = ""
+        if src.startswith("data:"):
+            raw, mime = _data_uri_to_bytes(src)
+            if raw:
+                try:
+                    from PIL import Image, ImageOps, ImageFilter  # ensure available
+                    import io as _io
+                    with Image.open(_io.BytesIO(raw)) as im:
+                        # resize, re-encode to configured format
+                        if img_max_w and im.width > img_max_w:
+                            ratio = img_max_w / im.width
+                            im = im.resize((img_max_w, int(im.height*ratio)))
+                        # re-encode
+                        buf = _io.BytesIO()
+                        if img_fmt.lower() in ("jpeg","jpg"):
+                            im = im.convert("RGB")
+                            im.save(buf, format="JPEG", quality=img_quality, optimize=True)
+                            mime2 = "image/jpeg"
+                        else:
+                            im.save(buf, format="PNG", optimize=True)
+                            mime2 = "image/png"
+                        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                        data_uri = f"data:{mime2};base64,{b64}"
+                        md_img = f'![{alt}]({data_uri})'
+                        embedded += 1
+                except Exception:
+                    skipped += 1
+            else:
+                skipped += 1
+        else:
+            # For non-data URIs, leave a normal markdown pointing to original src (no fetch to avoid side-effects)
+            md_img = f'![{alt}]({src})'
+            skipped += 1  # not embedded as base64
+
+        processed[token] = md_img or ""
+
+    # Replace tokens in markdown, preserving positions
+    for token, repl in processed.items():
+        md = md.replace(token, repl)
+
+    # Cleanup
+    md = _md_cleanup(md)
+
+    meta.setdefault("html_image_stats", {})
+    meta["html_image_stats"].update({
+        "found": len(imgs),
+        "embedded_base64": embedded,
+        "linked_only": skipped
+    })
+    meta["engine_html"] = f"markitdown+inline_images({ 'plugins' if use_plugins else 'core'})"
+
+    return md, meta
+(html_str)
             if md:
                 tables_md.append(md)
         if tables_md:
@@ -288,7 +440,159 @@ class _TableHTMLParser(HTMLParser):
         elif t == "table":
             self.in_table = False
 
-def _html_table_to_markdown(html_str: str) -> Optional[str]:
+def _html_table_to_markdown
+class _ImgStripper(HTMLParser):
+    """
+    Rebuilds HTML while replacing <img> tags with placeholders, and records their attributes.
+    Produces a sanitized HTML string preserving order, with tokens like <<<MDIMG_0>>>.
+    """
+    def __init__(self):
+        super().__init__()
+        self.out = []
+        self.images = []  # list of dicts: {src, alt, width, height}
+    def handle_starttag(self, tag, attrs):
+        t = tag.lower()
+        if t == "img":
+            d = {k.lower(): (v or "") for k,v in attrs}
+            self.images.append({
+                "src": d.get("src",""),
+                "alt": d.get("alt","").strip(),
+                "width": d.get("width",""),
+                "height": d.get("height","")
+            })
+            self.out.append(f"<<<MDIMG_{len(self.images)-1}>>>")
+        else:
+            # rebuild the tag
+            self.out.append("<" + t)
+            for k,v in attrs:
+                if v is None: v = ""
+                self.out.append(f' {k}="{html.escape(v, quote=True)}"')
+            self.out.append(">")
+    def handle_startendtag(self, tag, attrs):
+        t = tag.lower()
+        if t == "img":
+            d = {k.lower(): (v or "") for k,v in attrs}
+            self.images.append({
+                "src": d.get("src",""),
+                "alt": d.get("alt","").strip(),
+                "width": d.get("width",""),
+                "height": d.get("height","")
+            })
+            self.out.append(f"<<<MDIMG_{len(self.images)-1}>>>")
+        else:
+            self.out.append("<" + t)
+            for k,v in attrs:
+                if v is None: v = ""
+                self.out.append(f' {k}="{html.escape(v, quote=True)}"')
+            self.out.append(" />")
+    def handle_endtag(self, tag):
+        t = tag.lower()
+        if t != "img":
+            self.out.append(f"</{t}>")
+    def handle_data(self, data):
+        self.out.append(data)
+    def get_html(self):
+        return "".join(self.out)
+
+def _data_uri_to_bytes(data_uri: str) -> tuple[bytes, str] | tuple[None, None]:
+    try:
+        if not data_uri.startswith("data:"):
+            return None, None
+        header, b64 = data_uri.split(",", 1)
+        mime = "image/png"
+        if ";base64" in header:
+            # extract mime like data:image/png;base64
+            if ":" in header and ";" in header:
+                mime = header.split(":")[1].split(";")[0] or mime
+            raw = base64.b64decode(b64)
+            return raw, mime
+        return None, None
+    except Exception:
+        return None, None
+
+def _convert_html_with_inline_images(html_bytes: bytes, use_plugins: bool, img_fmt: str, img_quality: int, img_max_w: int, alt_prefix: str) -> tuple[str, dict]:
+    # Decode
+    try:
+        html_txt = html_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        html_txt = html_bytes.decode("latin-1", errors="ignore")
+
+    # Replace <img> with tokens
+    stripper = _ImgStripper()
+    stripper.feed(html_txt)
+    stripped_html = stripper.get_html()
+    imgs = stripper.images
+
+    # Convert text via MarkItDown (on sanitized HTML without <img> tags)
+    md_engine = MarkItDown(enable_plugins=use_plugins)
+    result = md_engine.convert(stripped_html, "text/html")
+    md = getattr(result, "text_content", "") or ""
+    meta = getattr(result, "metadata", {}) or {}
+    warns = getattr(result, "warnings", None)
+    if warns:
+        meta["warnings"] = warns
+
+    # Build md for each image token
+    embedded = 0
+    skipped = 0
+    processed = {}
+    for i, info in enumerate(imgs):
+        src = info.get("src","").strip()
+        alt = info.get("alt","").strip() or alt_prefix
+        token = f"<<<MDIMG_{i}>>>"
+        md_img = ""
+        if src.startswith("data:"):
+            raw, mime = _data_uri_to_bytes(src)
+            if raw:
+                try:
+                    from PIL import Image, ImageOps, ImageFilter  # ensure available
+                    import io as _io
+                    with Image.open(_io.BytesIO(raw)) as im:
+                        # resize, re-encode to configured format
+                        if img_max_w and im.width > img_max_w:
+                            ratio = img_max_w / im.width
+                            im = im.resize((img_max_w, int(im.height*ratio)))
+                        # re-encode
+                        buf = _io.BytesIO()
+                        if img_fmt.lower() in ("jpeg","jpg"):
+                            im = im.convert("RGB")
+                            im.save(buf, format="JPEG", quality=img_quality, optimize=True)
+                            mime2 = "image/jpeg"
+                        else:
+                            im.save(buf, format="PNG", optimize=True)
+                            mime2 = "image/png"
+                        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                        data_uri = f"data:{mime2};base64,{b64}"
+                        md_img = f'![{alt}]({data_uri})'
+                        embedded += 1
+                except Exception:
+                    skipped += 1
+            else:
+                skipped += 1
+        else:
+            # For non-data URIs, leave a normal markdown pointing to original src (no fetch to avoid side-effects)
+            md_img = f'![{alt}]({src})'
+            skipped += 1  # not embedded as base64
+
+        processed[token] = md_img or ""
+
+    # Replace tokens in markdown, preserving positions
+    for token, repl in processed.items():
+        md = md.replace(token, repl)
+
+    # Cleanup
+    md = _md_cleanup(md)
+
+    meta.setdefault("html_image_stats", {})
+    meta["html_image_stats"].update({
+        "found": len(imgs),
+        "embedded_base64": embedded,
+        "linked_only": skipped
+    })
+    meta["engine_html"] = f"markitdown+inline_images({ 'plugins' if use_plugins else 'core'})"
+
+    return md, meta
+(html_str: str) -> Optional[str]:
     if not html_str or "<table" not in html_str.lower():
         return None
     parser = _TableHTMLParser()
@@ -1023,6 +1327,7 @@ async def convert(
 
         is_pdf = guess_is_pdf(file.filename, file.content_type)
         is_img = guess_is_image(file.filename, file.content_type)
+is_html = guess_is_html(file.filename, file.content_type)
 
         selected_mode = (mode or PROCESSING_MODE).lower()
         if selected_mode not in ALLOWED_MODES:
@@ -1046,6 +1351,20 @@ async def convert(
             markdown = _md_cleanup(markdown)
 
         else:
+
+elif is_html:
+    # Convert HTML with inline <img> embedded as base64 (like PDF policy)
+    markdown, meta_html = _convert_html_with_inline_images(
+        content,
+        use_plugins=use_plugins,
+        img_fmt=IMG_FORMAT,
+        img_quality=IMG_JPEG_QUALITY,
+        img_max_w=IMG_MAX_WIDTH,
+        alt_prefix=IMG_ALT_PREFIX
+    )
+    metadata.update(meta_html)
+
+else:
             md_engine = MarkItDown(enable_plugins=use_plugins)
             result = md_engine.convert_stream(io.BytesIO(content), file_name=file.filename)
             markdown = getattr(result, "text_content", "") or ""
