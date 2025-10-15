@@ -338,8 +338,8 @@ def _convert_html_with_inline_images(
 
     # 3) Convert stripped HTML via MarkItDown
     md_engine = MarkItDown(enable_plugins=use_plugins)
-    result = md_engine.convert(stripped_html, "text/html")
-    md = getattr(result, "text_content", "") or ""
+    result = md_engine.convert_stream(io.BytesIO(stripped_html.encode('utf-8')), file_name='input.html')
+    md = getattr(result, 'text_content', '') or ''
     meta: Dict[str, Any] = getattr(result, "metadata", {}) or {}
     warns = getattr(result, "warnings", None)
     if warns:
@@ -384,6 +384,11 @@ def _convert_html_with_inline_images(
             md_img = f"![{alt}]({src})"
             linked += 1
         tokens[token] = md_img
+
+    
+    # If MarkItDown returned empty content (e.g., image-only HTML), fall back to listing images.
+    if not md.strip() and tokens:
+        md = "\n\n".join([v for k, v in tokens.items() if v])
 
     for token, repl in tokens.items():
         md = md.replace(token, repl)
