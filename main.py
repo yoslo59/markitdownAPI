@@ -1284,8 +1284,8 @@ async def convert(
                     ocr_meta["ocr_used_langs"] = sorted(list(ocr_meta["ocr_used_langs"]))
                 metadata.update(ocr_meta)
             markdown = _md_cleanup(markdown)
-
         elif is_html:
+            try:
                 # Convert HTML with inline <img> embedded as base64 (like PDF policy)
                 markdown, meta_html = _convert_html_with_inline_images(
                     content,
@@ -1296,6 +1296,16 @@ async def convert(
                     alt_prefix=IMG_ALT_PREFIX
                 )
                 metadata.update(meta_html)
+            except Exception as e:
+                metadata.setdefault('html_errors', []).append(f'{type(e).__name__}: {e}')
+                md_engine = MarkItDown(enable_plugins=use_plugins)
+                result = md_engine.convert_stream(io.BytesIO(content), file_name=file.filename)
+                markdown = getattr(result, 'text_content', '') or ''
+                metadata.update(getattr(result, 'metadata', {}) or {})
+                warnings = getattr(result, 'warnings', None)
+                if warnings:
+                    metadata['warnings'] = warnings
+                markdown = _md_cleanup(markdown)
 
         else:
             md_engine = MarkItDown(enable_plugins=use_plugins)
