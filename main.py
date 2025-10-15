@@ -8,7 +8,7 @@ import traceback
 from typing import Optional, Tuple, List, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from markitdown import MarkItDown
@@ -20,7 +20,7 @@ from paddleocr import PPStructureV3 as PPStructure
 from PIL import Image, ImageOps, ImageFilter
 import fitz  # PyMuPDF
 from html.parser import HTMLParser
-import html
+import html as html_mod  # éviter collision de nom
 
 # ---------------------------
 # Config via variables d'env
@@ -52,14 +52,15 @@ OCR_MIN_ACCEPT_LEN = int(os.getenv("OCR_MIN_ACCEPT_LEN", "10"))
 OCR_DISABLE_PAGE_FALLBACK = os.getenv("OCR_DISABLE_PAGE_FALLBACK", "false").lower() == "true"
 
 # Intégration images base64
+# NOTE: Pour obtenir du JPEG comme dans ton attendu, mets: IMG_FORMAT=jpeg
 EMBED_IMAGES       = os.getenv("EMBED_IMAGES", "ocr_only").strip()  # none | ocr_only | all
-IMG_FORMAT         = os.getenv("IMG_FORMAT", "png").strip().lower()
+IMG_FORMAT         = os.getenv("IMG_FORMAT", "jpeg").strip().lower()  # <<< par défaut en jpeg ici
 IMG_JPEG_QUALITY   = int(os.getenv("IMG_JPEG_QUALITY", "85"))
 IMG_MAX_WIDTH      = int(os.getenv("IMG_MAX_WIDTH", "1600"))
 IMG_ALT_PREFIX     = os.getenv("IMG_ALT_PREFIX", "Capture").strip()
 EMBED_SKIP_BG_IF_TEXT = os.getenv("EMBED_SKIP_BG_IF_TEXT", "true").lower() == "true"
 
-# Dossiers persistents
+# Dossiers persistants
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -111,22 +112,57 @@ def _md_cleanup(md: str) -> str:
     )
     return txt.strip()
 
-# --- NOUVEAU --- #
-# Convertir les images Markdown en data: vers des balises <img ...> HTML
-_MD_IMG_DATA_RE = re.compile(
-    r'!\[(?P<alt>[^\]]*)\]\((?P<src>data:[^)]+)\)',
+# -------------------------------------------------------------
+# HTML: Re-encoder toutes les <img src="data:..."> au format IMG_FORMAT
+# -------------------------------------------------------------
+_IMG_TAG_DATA_RE = re.compile(
+    r'<img\b(?P<attrs>[^>]*?)\bsrc=["\'](?P<src>data:image/[^;\s]+;base64,(?P<b64>[A-Za-z0-9+/=\s]+))["\'](?P<attrs2>[^>]*)>',
     flags=re.IGNORECASE
 )
 
-def _md_image_data_to_html(md: str) -> str:
-    if not md:
-        return md
+def _pil_resize_max(im: Image.Image, max_w: int) -> Image.Image:
+    if max_w and im.width > max_w:
+        ratio = max_w / im.width
+        new_h = int(im.height * ratio)
+        return im.resize((max_w, new_h), Image.LANCZOS)
+    return im
+
+def _pil_to_base64(im: Image.Image, fmt: str = "png", quality: int = 85) -> str:
+    buf = io.BytesIO()
+    if fmt.lower() in ("jpeg", "jpg"):
+        im = im.convert("RGB")
+        im.save(buf, format="JPEG", quality=quality, optimize=True)
+        mime = "image/jpeg"
+    else:
+        im.save(buf, format="PNG", optimize=True)
+        mime = "image/png"
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+def _html_reencode_inline_images(md_or_html: str) -> str:
+    """
+    Convertit toute <img src="data:image/...;base64, ..."> vers le format IMG_FORMAT,
+    normalise alt="" et style="max-width: 100%;".
+    """
+    if not md_or_html:
+        return md_or_html
+
     def _repl(m: re.Match) -> str:
-        alt = (m.group("alt") or "").strip()
-        src = m.group("src")
-        return f'<img src="{src}" alt="{html.escape(alt)}" style="max-width: 100%;">'
-    return _MD_IMG_DATA_RE.sub(_repl, md)
-# --- FIN NOUVEAU --- #
+        b64 = m.group("b64").replace("\n", "").replace("\r", "").strip()
+        try:
+            raw = base64.b64decode(b64)
+            with Image.open(io.BytesIO(raw)) as im:
+                im = _pil_resize_max(im, IMG_MAX_WIDTH)
+                data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+        except Exception:
+            # En cas d’échec, on laisse tel quel
+            data_uri = m.group("src")
+
+        # alt="" systématique (attendu)
+        # on ne conserve pas l'alt d'origine ni width/height explicites
+        return f'<img src="{data_uri}" alt="" style="max-width: 100%;">'
+
+    return _IMG_TAG_DATA_RE.sub(_repl, md_or_html)
 
 # ---------------------------
 # OCR utils (PaddleOCR + PPStructure)
@@ -253,7 +289,7 @@ class _TableHTMLParser(HTMLParser):
     def handle_endtag(self, tag):
         t = tag.lower()
         if t in ("td", "th") and self.in_cell:
-            txt = html.unescape("".join(self.buf)).strip()
+            txt = html_mod.unescape("".join(self.buf)).strip()
             txt = re.sub(r"\s*\|\s*", " ", txt)
             self.current_row.append(txt)
             self.in_cell = False
@@ -295,26 +331,8 @@ def _raster_pdf_page(page: fitz.Page, dpi: int) -> Image.Image:
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 # ---------------------------
-# Images utilitaires
+# Images utilitaires (déjà plus haut: _pil_resize_max, _pil_to_base64)
 # ---------------------------
-def _pil_resize_max(im: Image.Image, max_w: int) -> Image.Image:
-    if max_w and im.width > max_w:
-        ratio = max_w / im.width
-        new_h = int(im.height * ratio)
-        return im.resize((max_w, new_h), Image.LANCZOS)
-    return im
-
-def _pil_to_base64(im: Image.Image, fmt: str = "png", quality: int = 85) -> str:
-    buf = io.BytesIO()
-    if fmt.lower() in ("jpeg", "jpg"):
-        im = im.convert("RGB")
-        im.save(buf, format="JPEG", quality=quality, optimize=True)
-        mime = "image/jpeg"
-    else:
-        im.save(buf, format="PNG", optimize=True)
-        mime = "image/png"
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:{mime};base64,{b64}"
 
 def crop_bbox_image(page: fitz.Page, bbox: Tuple[float, float, float, float], dpi: int) -> Optional[Image.Image]:
     try:
@@ -422,7 +440,7 @@ def render_pdf_markdown_inline(
             page_h = page.rect.height
             page_area = max(1.0, page_w * page_h)
 
-            # 1) TEXTE (lignes) + marquage images
+            # 1) TEXTE + marquage images
             for b in raw.get("blocks", []):
                 btype = b.get("type", 0)
                 bbox = tuple(b.get("bbox", (0, 0, 0, 0)))
@@ -454,7 +472,7 @@ def render_pdf_markdown_inline(
                     area = max(1.0, (x1 - x0) * (y1 - y0))
                     atoms.append({"bbox": bbox, "md": "", "kind": "image_raw", "area_ratio": min(1.0, area / page_area)})
 
-            # 2) IMAGES -> PPStructure (tables) puis OCR texte, sinon embed
+            # 2) IMAGES : PPStructure -> OCR -> embed
             processed = []
             seen_hashes: set = set()
             page_has_vector_text = any(a["kind"] == "text" for a in atoms)
@@ -476,17 +494,12 @@ def render_pdf_markdown_inline(
                 area_ratio = a["area_ratio"]
                 is_background_like = area_ratio > 0.85
 
-                # Politique d'OCR (always en plugins ON)
-                if img_ocr_policy == "never":
-                    do_img_ocr = False
-                else:
-                    do_img_ocr = True
+                do_img_ocr = (img_ocr_policy != "never")
 
                 md_img = ""
                 txt, q, used_lang = "", 0.0, None
 
                 if do_img_ocr and OCR_ENABLED:
-                    # d’abord PPStructure (tables)
                     md_table = _ppstruct_tables_to_md(im)
                     if md_table:
                         md_img = md_table
@@ -511,8 +524,7 @@ def render_pdf_markdown_inline(
                         if not (EMBED_SKIP_BG_IF_TEXT and is_background_like and page_has_vector_text):
                             im = _pil_resize_max(im, IMG_MAX_WIDTH)
                             data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
-                            # --- CHANGEMENT: balise <img> HTML, pas image Markdown
-                            md_img = f'<img src="{data_uri}" alt="{IMG_ALT_PREFIX} – page {p+1}" style="max-width: 100%;">'
+                            md_img = f'<img src="{data_uri}" alt="" style="max-width: 100%;">'
                             a_kind = "image_embed"
                         else:
                             md_img = ""
@@ -542,7 +554,7 @@ def render_pdf_markdown_inline(
 
             atoms = processed
 
-            # 3) Assemblage par bandes horizontales
+            # 3) Assemblage
             atoms.sort(key=lambda a: (a["bbox"][1], a["bbox"][0]))
             band = []
             y_last = None
@@ -563,7 +575,7 @@ def render_pdf_markdown_inline(
                     flush_band(); band = [a]; y_last = y0
             flush_band()
 
-            # 4) Fallback OCR page si aucun contenu
+            # 4) Fallback OCR page
             if not md_lines or not any(l.strip() for l in md_lines[-1:]):
                 page_buf = []
                 try:
@@ -590,7 +602,7 @@ def render_pdf_markdown_inline(
                 if page_buf:
                     md_lines.append("\n\n".join(page_buf))
 
-        # Suppression des en-têtes/pieds de page répétés
+        # Nettoyages header/footer répétés
         if len(md_lines) > 1:
             first_lines: List[str] = []
             last_lines: List[str] = []
@@ -625,6 +637,9 @@ def render_pdf_markdown_inline(
     finally:
         doc.close()
 
+# ---------------------------
+# UI (bouton téléchargement stylé)
+# ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
 <head>
@@ -689,9 +704,10 @@ HTML_PAGE = r'''<!doctype html>
       min-height:260px; width:100%; resize:vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       font-size:.95rem; line-height:1.55
     }
-    button{
+    button,.btn{
       background:linear-gradient(135deg, var(--accent), var(--accent-2));
-      color:white; border:0; border-radius:12px; padding:10px 14px; cursor:pointer; font-weight:700
+      color:white; border:0; border-radius:12px; padding:10px 14px; cursor:pointer; font-weight:700;
+      display:inline-flex; align-items:center; gap:8px; text-decoration:none;
     }
     button.btn-ghost{
       background:transparent; border:1px solid rgba(255,255,255,0.25); color:var(--text)
@@ -772,7 +788,8 @@ HTML_PAGE = r'''<!doctype html>
 
       <div class="row" style="margin-top:12px; gap:10px">
         <button id="convert">Convertir</button>
-        <a id="download" download="sortie.md" style="display:none">Télécharger Markdown</a>
+        <!-- Lien stylé comme bouton -->
+        <a id="download" class="btn" role="button" download="sortie.md" style="display:none">Télécharger Markdown</a>
         <button id="copy" class="btn-ghost" title="Copier le Markdown">Copier</button>
         <button id="clear" class="btn-ghost" title="Vider les zones">Vider</button>
       </div>
@@ -890,7 +907,7 @@ async def convert(
     - Plugins OFF : MarkItDown simple (+ cleanup).
     - Plugins ON (PDF) : pipeline inline (texte vectoriel + OCR images + PPStructure), avec 'force_ocr' qui assouplit l'acceptation.
     - Image seule : OCR/PPStructure + base64 si OCR pauvre.
-    - HTML : conversion MarkItDown puis normalisation des images data: en <img ...> HTML.
+    - HTML : conversion MarkItDown puis re-encodage des <img data:...> au format IMG_FORMAT (alt="", style max-width).
     """
     try:
         t_start = time.perf_counter()
@@ -899,10 +916,8 @@ async def convert(
         if not content:
             raise HTTPException(status_code=400, detail="Fichier vide")
 
-        in_path = None
         if SAVE_UPLOADS:
-            in_path = os.path.join(UPLOAD_DIR, file.filename)
-            with open(in_path, "wb") as f:
+            with open(os.path.join(UPLOAD_DIR, file.filename), "wb") as f:
                 f.write(content)
 
         is_pdf = guess_is_pdf(file.filename, file.content_type)
@@ -928,9 +943,8 @@ async def convert(
                 if isinstance(ocr_meta.get("ocr_used_langs"), set):
                     ocr_meta["ocr_used_langs"] = sorted(list(ocr_meta["ocr_used_langs"]))
                 metadata.update(ocr_meta)
-            # IMPORTANT : si des images data: sont présentes en Markdown (![](...)),
-            # on les re-normalise en <img ...> pour uniformiser l’output.
-            markdown = _md_image_data_to_html(markdown)
+
+            # Nettoyage
             markdown = _md_cleanup(markdown)
 
         else:
@@ -942,11 +956,9 @@ async def convert(
             if warnings:
                 metadata["warnings"] = warnings
 
-            # --- NOUVEAU : Post-traitement HTML/HTM
-            # 1) On laisse intacts les <img src="data:..."> existants
-            # 2) On convertit toute image Markdown data: en balise <img ...>
+            # --- Post-traitement HTML : re-encoder toutes les data URI au format IMG_FORMAT (ex: jpeg)
             if is_html:
-                markdown = _md_image_data_to_html(markdown)
+                markdown = _html_reencode_inline_images(markdown)
 
             markdown = _md_cleanup(markdown)
 
@@ -964,8 +976,7 @@ async def convert(
                         with Image.open(io.BytesIO(content)) as im:
                             im = _pil_resize_max(im, IMG_MAX_WIDTH)
                             data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
-                            # HTML <img>, pas Markdown
-                            markdown += f'\n\n<img src="{data_uri}" alt="{IMG_ALT_PREFIX}" style="max-width: 100%;">\n'
+                            markdown += f'\n\n<img src="{data_uri}" alt="" style="max-width: 100%;">\n'
                 except Exception as e:
                     metadata.setdefault("ocr_errors", []).append(f"image: {type(e).__name__}: {e}")
                     if EMBED_IMAGES in ("all", "ocr_only"):
@@ -973,15 +984,13 @@ async def convert(
                             with Image.open(io.BytesIO(content)) as im:
                                 im = _pil_resize_max(im, IMG_MAX_WIDTH)
                                 data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
-                                markdown += f'\n\n<img src="{data_uri}" alt="{IMG_ALT_PREFIX}" style="max-width: 100%;">\n'
+                                markdown += f'\n\n<img src="{data_uri}" alt="" style="max-width: 100%;">\n'
                         except Exception:
                             pass
 
         out_name = f"{os.path.splitext(file.filename)[0]}.md"
-        out_path = None
         if SAVE_OUTPUTS:
-            out_path = os.path.join(OUTPUT_DIR, out_name)
-            with open(out_path, "w", encoding="utf-8") as f:
+            with open(os.path.join(OUTPUT_DIR, out_name), "w", encoding="utf-8") as f:
                 f.write(markdown)
 
         dt = time.perf_counter() - t_start
@@ -1021,8 +1030,7 @@ def ocr_image_bytes(img_bytes: bytes, mode: str) -> Tuple[str, float, str]:
 # ---------------------------
 def _ppstruct_tables_to_md(im: Image.Image) -> Optional[str]:
     try:
-        # Place-holder : on suppose que la logique réelle existe déjà dans ton projet,
-        # rien changé ici pour ne pas casser ce qui marche chez toi.
+        # Placeholder volontaire (ne pas casser ta logique existante).
         return None
     except Exception:
         return None
@@ -1031,5 +1039,4 @@ def _classify_ocr_block(txt: str) -> str:
     txt = (txt or "").strip()
     if not txt:
         return ""
-    # Simple : on renvoie tel quel. Ta logique fine peut être différente – inchangée ici.
     return _wrap_tables_as_code(txt)
