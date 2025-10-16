@@ -112,25 +112,17 @@ def _md_cleanup(md: str) -> str:
     )
     return txt.strip()
 
-# ---------------------------
-# HTML: convertir <img src="data:..."> -> ![alt](data:...)
-# ---------------------------
+# HTML: convertir <img src="data:image/..."> en image Markdown ![alt](data:...)
 _HTML_IMG_DATA_RE = re.compile(
-    r'<img\b[^>]*\bsrc=["\'](?P<src>data:[^"\']+)["\'][^>]*?(?:\balt=["\'](?P<alt>[^"\']*)["\'])?[^>]*>',
+    r'<img\b[^>]*\bsrc=["\'](?P<src>data:image/[^"\']+)["\'][^>]*>',
     flags=re.IGNORECASE
 )
 
-def _html_img_tags_to_markdown_data(md_or_html: str, default_alt: str = "Capture") -> str:
-    """
-    Remplace toute balise <img src="data:..."> par une image Markdown ![alt](data:...).
-    On conserve le payload data: tel quel (pas de ré-encodage).
-    """
+def _html_img_datauri_to_markdown(md_or_html: str, alt_text: str = "Capture – page 1") -> str:
     if not md_or_html or "<img" not in md_or_html.lower():
         return md_or_html
     def _repl(m: re.Match) -> str:
-        src = m.group("src") or ""
-        alt = (m.group("alt") or "").strip() or default_alt
-        return f'![{alt}]({src})'
+        return f'![{alt_text}]({m.group("src")})'
     return _HTML_IMG_DATA_RE.sub(_repl, md_or_html)
 
 # ---------------------------
@@ -1032,7 +1024,7 @@ async def convert(
 ):
     """
     - Plugins OFF : MarkItDown simple (+ cleanup).
-    - Plugins ON (PDF) : pipeline inline (texte vectoriel + OCR images + PPStructure), avec 'force_ocr' qui assouplit l'acceptation.
+    - Plugins ON (PDF) : pipeline inline (texte vectoriel + OCR et PPStructure), avec 'force_ocr' qui assouplit l'acceptation.
     - Image seule : OCR/PPStructure + base64 si OCR pauvre.
     """
     try:
@@ -1082,9 +1074,9 @@ async def convert(
             if warnings:
                 metadata["warnings"] = warnings
 
-            # Spécifique HTML : remplace <img data:...> par ![alt](data:...)
+            # Post-traitement HTML: convertir <img data:...> en image Markdown comme PDF
             if is_html:
-                markdown = _html_img_tags_to_markdown_data(markdown, default_alt=IMG_ALT_PREFIX)
+                markdown = _html_img_datauri_to_markdown(markdown, alt_text=f"{IMG_ALT_PREFIX} – page 1")
 
             markdown = _md_cleanup(markdown)
 
