@@ -90,6 +90,11 @@ def guess_is_image(filename: str, content_type: Optional[str]) -> bool:
         return True
     return any(filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"))
 
+def guess_is_html(filename: str, content_type: Optional[str]) -> bool:
+    if content_type and "html" in content_type.lower():
+        return True
+    return filename.lower().endswith((".html", ".htm"))
+
 def _md_cleanup(md: str) -> str:
     if not md:
         return md
@@ -106,6 +111,27 @@ def _md_cleanup(md: str) -> str:
         txt, flags=re.S
     )
     return txt.strip()
+
+# ---------------------------
+# HTML: convertir <img src="data:..."> -> ![alt](data:...)
+# ---------------------------
+_HTML_IMG_DATA_RE = re.compile(
+    r'<img\b[^>]*\bsrc=["\'](?P<src>data:[^"\']+)["\'][^>]*?(?:\balt=["\'](?P<alt>[^"\']*)["\'])?[^>]*>',
+    flags=re.IGNORECASE
+)
+
+def _html_img_tags_to_markdown_data(md_or_html: str, default_alt: str = "Capture") -> str:
+    """
+    Remplace toute balise <img src="data:..."> par une image Markdown ![alt](data:...).
+    On conserve le payload data: tel quel (pas de ré-encodage).
+    """
+    if not md_or_html or "<img" not in md_or_html.lower():
+        return md_or_html
+    def _repl(m: re.Match) -> str:
+        src = m.group("src") or ""
+        alt = (m.group("alt") or "").strip() or default_alt
+        return f'![{alt}]({src})'
+    return _HTML_IMG_DATA_RE.sub(_repl, md_or_html)
 
 # ---------------------------
 # OCR utils (PaddleOCR + PPStructure)
@@ -249,6 +275,7 @@ class _TableHTMLParser(HTMLParser):
         super().__init__()
         self.in_table = False
         self.in_tr = False
+        # self.in_th = False
         self.in_cell = False
         self.headers: List[str] = []
         self.rows: List[List[str]] = []
@@ -661,7 +688,7 @@ def render_pdf_markdown_inline(
             if not has_any_text and not OCR_DISABLE_PAGE_FALLBACK and OCR_ENABLED:
                 try:
                     best_txt, best_score, used_lang = "", -1e9, None
-                    for d in dpi_candidates:
+                    for d in OCR_DPI_CANDIDATES if mode == "quality" else [min(OCR_DPI, 300)]:
                         im_page = _raster_pdf_page(page, d)
                         txt, score, lang = _paddle_ocr_text_best(im_page, mode)
                         if lang:
@@ -1023,6 +1050,7 @@ async def convert(
 
         is_pdf = guess_is_pdf(file.filename, file.content_type)
         is_img = guess_is_image(file.filename, file.content_type)
+        is_html = guess_is_html(file.filename, file.content_type)
 
         selected_mode = (mode or PROCESSING_MODE).lower()
         if selected_mode not in ALLOWED_MODES:
@@ -1053,6 +1081,11 @@ async def convert(
             warnings = getattr(result, "warnings", None)
             if warnings:
                 metadata["warnings"] = warnings
+
+            # Spécifique HTML : remplace <img data:...> par ![alt](data:...)
+            if is_html:
+                markdown = _html_img_tags_to_markdown_data(markdown, default_alt=IMG_ALT_PREFIX)
+
             markdown = _md_cleanup(markdown)
 
             if OCR_ENABLED and is_img:
