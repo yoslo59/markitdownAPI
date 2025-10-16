@@ -45,7 +45,6 @@ OCR_DPI_CANDIDATES = [int(x) for x in os.getenv("OCR_DPI_CANDIDATES", "300,350,4
 OCR_SCORE_GOOD_ENOUGH = float(os.getenv("OCR_SCORE_GOOD_ENOUGH", "0.6"))
 
 # Politique OCR images & fallback
-# En “plugins ON”, on lance l’OCR image systématiquement (comme Marker).
 IMAGE_OCR_MODE = os.getenv("IMAGE_OCR_MODE", "smart").strip()  # smart | conservative | always | never
 IMAGE_OCR_MIN_WORDS = int(os.getenv("IMAGE_OCR_MIN_WORDS", "10"))
 OCR_TEXT_QUALITY_MIN = float(os.getenv("OCR_TEXT_QUALITY_MIN", "0.25"))
@@ -112,18 +111,53 @@ def _md_cleanup(md: str) -> str:
     )
     return txt.strip()
 
-# HTML: convertir <img src="data:image/..."> en image Markdown ![alt](data:...)
-_HTML_IMG_DATA_RE = re.compile(
+# --------------------------------------------------------------------
+# HTML <img data:...>  ➜  Markdown images avec payload base64 COMPLET
+# --------------------------------------------------------------------
+_HTML_DATA_URI_IN_IMG = re.compile(
+    r'<img\b[^>]*\bsrc=["\'](data:image/[^"\']+)["\']',
+    flags=re.IGNORECASE
+)
+
+_MD_DATA_IMG = re.compile(
+    r'!\[[^\]]*\]\(\s*(?P<src>data:image/[^)]+)\s*\)'
+)
+
+_HTML_IMG_DATA_TAG = re.compile(
     r'<img\b[^>]*\bsrc=["\'](?P<src>data:image/[^"\']+)["\'][^>]*>',
     flags=re.IGNORECASE
 )
 
+def _extract_html_data_imgs(html_text: str) -> List[str]:
+    """Retourne la liste ordonnée des data-URIs trouvées dans le HTML d'origine."""
+    if not html_text:
+        return []
+    return _HTML_DATA_URI_IN_IMG.findall(html_text)
+
 def _html_img_datauri_to_markdown(md_or_html: str, alt_text: str = "Capture – page 1") -> str:
+    """
+    Convertit <img src="data:..."> vers Markdown si MarkItDown a laissé du HTML.
+    On ne raccourcit pas, on garde le data: tel quel.
+    """
     if not md_or_html or "<img" not in md_or_html.lower():
         return md_or_html
-    def _repl(m: re.Match) -> str:
-        return f'![{alt_text}]({m.group("src")})'
-    return _HTML_IMG_DATA_RE.sub(_repl, md_or_html)
+    return _HTML_IMG_DATA_TAG.sub(lambda m: f'![{alt_text}]({m.group("src")})', md_or_html)
+
+def _inject_full_data_uris_into_markdown(md: str, data_uris: List[str], alt_prefix: str = "Capture") -> str:
+    """
+    Remplace chaque image Markdown `![...](data:image/...)` par
+    `![<alt_prefix> – page i](<data_uri_complète>)` en suivant l'ordre d'apparition.
+    Ne tronque rien, conserve TOUT le payload base64.
+    """
+    if not md or not data_uris:
+        return md
+    idx = 0
+    def repl(m: re.Match) -> str:
+        nonlocal idx
+        src_full = data_uris[idx] if idx < len(data_uris) else m.group("src")
+        idx += 1
+        return f'![{alt_prefix} – page {idx}]({src_full})'
+    return _MD_DATA_IMG.sub(repl, md)
 
 # ---------------------------
 # OCR utils (PaddleOCR + PPStructure)
@@ -267,7 +301,6 @@ class _TableHTMLParser(HTMLParser):
         super().__init__()
         self.in_table = False
         self.in_tr = False
-        # self.in_th = False
         self.in_cell = False
         self.headers: List[str] = []
         self.rows: List[List[str]] = []
@@ -301,7 +334,6 @@ class _TableHTMLParser(HTMLParser):
             self.is_th = False
         elif t == "tr" and self.in_tr:
             if self.current_row:
-                # s'il y a une ligne d'en-têtes évidente (th), PP-Structure l'a déjà mise au début
                 self.rows.append(self.current_row)
             self.in_tr = False
         elif t == "table":
@@ -316,10 +348,8 @@ def _html_table_to_markdown(html_str: str) -> Optional[str]:
         rows = [r for r in parser.rows if any(cell.strip() for cell in r)]
         if not rows:
             return None
-        # largeur max uniformisée
         cols = max(len(r) for r in rows)
         norm = [r + [""] * (cols - len(r)) for r in rows]
-        # première ligne = en-têtes
         head = norm[0]
         sep = ["---"] * cols
         body = norm[1:] if len(norm) > 1 else []
@@ -342,10 +372,9 @@ def _fast_has_text_with_paddle(im: Image.Image, mode: str, min_words: int) -> bo
 
 def ocr_image_bytes(img_bytes: bytes, mode: str) -> Tuple[str, float, str]:
     with Image.open(io.BytesIO(img_bytes)) as im:
-        # D’abord tenter une table via PPStructure
         md_table = _ppstruct_tables_to_md(im)
         if md_table:
-            return md_table, 1.0, "en(struct)"  # on considère “qualité OK”
+            return md_table, 1.0, "en(struct)"
         txt, score, used_lang = _paddle_ocr_text_best(im, mode)
         return _classify_ocr_block(txt), score, used_lang
 
@@ -568,17 +597,12 @@ def render_pdf_markdown_inline(
                 area_ratio = a["area_ratio"]
                 is_background_like = area_ratio > 0.85
 
-                # Politique d'OCR (always en plugins ON)
-                if img_ocr_policy == "never":
-                    do_img_ocr = False
-                else:
-                    do_img_ocr = True
+                do_img_ocr = (img_ocr_policy != "never")
 
                 md_img = ""
                 txt, q, used_lang = "", 0.0, None
 
                 if do_img_ocr and OCR_ENABLED:
-                    # 2.1 – d’abord PPStructure (tables)
                     md_table = _ppstruct_tables_to_md(im)
                     if md_table:
                         md_img = md_table
@@ -586,7 +610,6 @@ def render_pdf_markdown_inline(
                         q = 1.0
                         used_lang = "en(struct)"
                     else:
-                        # 2.2 – texte classique
                         try:
                             txt, q, used_lang = _paddle_ocr_text_best(im, mode)
                         except Exception as e:
@@ -737,6 +760,9 @@ def render_pdf_markdown_inline(
     finally:
         doc.close()
 
+# ---------------------------
+# UI (inchangée hors style)
+# ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
 <head>
@@ -826,51 +852,21 @@ HTML_PAGE = r'''<!doctype html>
       background:rgba(255,255,255,0.03);
     }
     .muted{color:var(--muted)}
-
-    /* Dropzone */
-    .drop{
-      border:1.5px dashed rgba(255,255,255,0.18);
-      border-radius:14px;
-      padding:18px;
-      text-align:center;
-      cursor:pointer;
-      transition:.15s border-color ease, background .15s ease;
-      background:rgba(255,255,255,0.02);
-      width:100%;
-    }
+    .drop{ border:1.5px dashed rgba(255,255,255,0.18); border-radius:14px; padding:18px; text-align:center; cursor:pointer; background:rgba(255,255,255,0.02); width:100%; }
     .drop:hover{border-color:rgba(255,255,255,0.35)}
     .drop.active{border-color:var(--accent); background:rgba(99,179,255,.06)}
-
     .filemeta{font-size:.95rem; color:var(--text); opacity:.9}
-
-    /* Switches (sliders) */
     .switch{position:relative; display:inline-block; width:44px; height:24px}
     .switch input{opacity:0; width:0; height:0}
-    .slider{
-      position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0;
-      background:rgba(255,255,255,0.12); transition:.2s; border-radius:999px; border:1px solid rgba(255,255,255,0.2);
-    }
-    .slider:before{
-      position:absolute; content:""; height:18px; width:18px; left:2px; top:2.5px;
-      background:white; transition:.2s; border-radius:50%;
-    }
-    .switch input:checked + .slider{
-      background:linear-gradient(135deg, var(--accent), var(--accent-2));
-      border-color:transparent;
-    }
+    .slider{ position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background:rgba(255,255,255,0.12); transition:.2s; border-radius:999px; border:1px solid rgba(255,255,255,0.2); }
+    .slider:before{ position:absolute; content:""; height:18px; width:18px; left:2px; top:2.5px; background:white; transition:.2s; border-radius:50%; }
+    .switch input:checked + .slider{ background:linear-gradient(135deg, var(--accent), var(--accent-2)); border-color:transparent; }
     .switch input:checked + .slider:before{ transform:translateX(20px) }
-
     .progress{height:10px; background:rgba(255,255,255,0.08); border-radius:999px; overflow:hidden; display:none; margin-top:10px}
     .bar{height:100%; width:40%; background:linear-gradient(135deg, var(--accent), var(--accent-2)); border-radius:999px; animation:slide 1.2s infinite}
     @keyframes slide{0%{transform:translateX(-100%)}50%{transform:translateX(50%)}100%{transform:translateX(150%)}}
-
     .stats{display:flex; gap:12px; align-items:center; margin-top:10px; flex-wrap:wrap}
-    .tag{
-      display:inline-flex; gap:6px; align-items:center;
-      background:rgba(255,255,255,0.05);
-      border:1px solid rgba(255,255,255,0.15);
-      border-radius:999px; padding:6px 10px; font-size:.9rem
-    }
+    .tag{ display:inline-flex; gap:6px; align-items:center; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.15); border-radius:999px; padding:6px 10px; font-size:.9rem }
     .tag b{font-weight:800}
   </style>
 </head>
@@ -1026,6 +1022,7 @@ async def convert(
     - Plugins OFF : MarkItDown simple (+ cleanup).
     - Plugins ON (PDF) : pipeline inline (texte vectoriel + OCR et PPStructure), avec 'force_ocr' qui assouplit l'acceptation.
     - Image seule : OCR/PPStructure + base64 si OCR pauvre.
+    - HTML : images data: réinjectées avec payload COMPLET + alt standardisé.
     """
     try:
         t_start = time.perf_counter()
@@ -1074,12 +1071,21 @@ async def convert(
             if warnings:
                 metadata["warnings"] = warnings
 
-            # Post-traitement HTML: convertir <img data:...> en image Markdown comme PDF
+            # --- Spécifique HTML : convertir et RÉINJECTER les data URIs complètes ---
             if is_html:
+                # 1) HTML source pour extraire le payload base64 complet
+                html_text = content.decode("utf-8", errors="ignore")
+                html_data_uris = _extract_html_data_imgs(html_text)
+
+                # 2) Si MarkItDown a laissé des <img>, on les passe en Markdown (alt "Capture – page 1" par défaut)
                 markdown = _html_img_datauri_to_markdown(markdown, alt_text=f"{IMG_ALT_PREFIX} – page 1")
+
+                # 3) Réinjection des payloads complets et alt "Capture – page N"
+                markdown = _inject_full_data_uris_into_markdown(markdown, html_data_uris, alt_prefix=IMG_ALT_PREFIX)
 
             markdown = _md_cleanup(markdown)
 
+            # Cas image brute : OCR + embed si besoin (inchangé)
             if OCR_ENABLED and is_img:
                 try:
                     ocr_text, score, used_lang = ocr_image_bytes(content, selected_mode)
