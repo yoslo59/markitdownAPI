@@ -50,7 +50,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="5.2-json-pptx")
+app = FastAPI(title="MarkItDown API", version="5.3-json-table")
 
 app.add_middleware(
     CORSMiddleware,
@@ -170,12 +170,67 @@ def _inject_full_data_uris_into_markdown(md: str, uris: List[str], prefix: str =
 # ---------------------------
 
 def render_json_markdown(content: bytes) -> str:
-    """Formatte le JSON proprement."""
+    """
+    Formatte le JSON :
+    - Si c'est une liste d'objets plats -> Tableau Markdown.
+    - Si c'est un dictionnaire plat -> Tableau Clé/Valeur.
+    - Sinon -> Bloc de code JSON pretty-printed.
+    """
     try:
         data = json.loads(content)
-        # Pretty print avec indentation
+        
+        # 1. Liste d'objets (ex: export DB ou Excel)
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            # Vérification structure plate (pas de sous-objets complexes)
+            is_flat = True
+            headers = []
+            
+            # Récupération de toutes les clés possibles
+            for row in data:
+                if not isinstance(row, dict): continue
+                for k in row.keys():
+                    if k not in headers: headers.append(k)
+                
+                # Check profondeur
+                for v in row.values():
+                    if isinstance(v, (dict, list)):
+                        is_flat = False
+                        break
+                if not is_flat: break
+            
+            if is_flat and headers:
+                lines = []
+                # Header
+                lines.append("| " + " | ".join(str(h) for h in headers) + " |")
+                # Separator
+                lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+                # Rows
+                for row in data:
+                    if not isinstance(row, dict): continue
+                    row_vals = []
+                    for h in headers:
+                        val = row.get(h, "")
+                        # Échappement basique pour ne pas casser le tableau MD
+                        s_val = str(val).replace("|", "&#124;").replace("\n", "<br>")
+                        row_vals.append(s_val)
+                    lines.append("| " + " | ".join(row_vals) + " |")
+                return "\n".join(lines)
+
+        # 2. Objet simple (Clé / Valeur)
+        elif isinstance(data, dict):
+            # Check si plat
+            is_flat = all(not isinstance(v, (dict, list)) for v in data.values())
+            if is_flat and data:
+                lines = ["| Clé | Valeur |", "| --- | --- |"]
+                for k, v in data.items():
+                    s_val = str(v).replace("|", "&#124;").replace("\n", "<br>")
+                    lines.append(f"| {k} | {s_val} |")
+                return "\n".join(lines)
+
+        # 3. Fallback : Code block
         formatted = json.dumps(data, indent=2, ensure_ascii=False)
         return f"```json\n{formatted}\n```"
+
     except json.JSONDecodeError:
         return "```text\n(Fichier JSON invalide)\n```"
 
@@ -344,7 +399,7 @@ HTML_PAGE = r'''<!doctype html>
 <body>
   <div class="container">
     <h1>MarkItDown</h1>
-    <div class="desc">PDF · DOCX · PPTX · JSON · HTML · Image</div>
+    <div class="desc">Convertisseur PDF · DOCX · PPTX · JSON · HTML en Markdown/div>
 
     <div class="card">
       <div id="dropzone">Glissez votre fichier ici ou cliquez pour parcourir</div>
