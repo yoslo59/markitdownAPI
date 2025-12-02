@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir \
     markitdown \
     mammoth \
+    python-pptx \
     fastapi \
     uvicorn \
     python-multipart \
