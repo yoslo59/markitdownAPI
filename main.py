@@ -379,7 +379,13 @@ dz.ondragleave = () => dz.classList.remove("dragover");
 dz.ondrop = e => { e.preventDefault(); dz.classList.remove("dragover"); if(e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); };
 inp.onchange = () => { if(inp.files[0]) handleFile(inp.files[0]); };
 
-function handleFile(f) { inp.files = (new DataTransfer().items.add(f) && new DataTransfer().files) || inp.files; $("status").innerText = f.name; $("convert").disabled = false; }
+function handleFile(f) {
+    const dt = new DataTransfer();
+    dt.items.add(f);
+    inp.files = dt.files;
+    $("status").innerText = f.name;
+    $("convert").disabled = false;
+}
 
 $("convert").onclick = async () => {
     const f = inp.files[0];
