@@ -84,12 +84,10 @@ def _md_cleanup(md: str) -> str:
         l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)
         lines.append(l)
     txt = "\n".join(lines)
-    # Encapsulation des blocs de texte brut bizarres
-    txt = re.sub(
-        r"(?:^|\n)((?:[|+\-=_].*\n){2,})",
-        lambda m: "```text\n" + m.group(1).strip() + "\n```",
-        txt, flags=re.S
-    )
+    
+    # Note : L'encapsulation automatique dans ```text``` a été supprimée ici 
+    # pour éviter les faux positifs sur les listes ou le texte brut.
+    
     return txt.strip()
 
 def _remove_headers_footers(md_lines: List[str]) -> List[str]:
