@@ -399,7 +399,7 @@ HTML_PAGE = r'''<!doctype html>
 <body>
   <div class="container">
     <h1>MarkItDown</h1>
-    <div class="desc">Convertisseur PDF · DOCX · PPTX · JSON · HTML en Markdown/div>
+    <div class="desc">Convertisseur PDF · DOCX · PPTX · JSON · HTML en Markdown</div>
 
     <div class="card">
       <div id="dropzone">Glissez votre fichier ici ou cliquez pour parcourir</div>
