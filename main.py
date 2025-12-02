@@ -46,7 +46,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ---------------------------
 # App FastAPI
 # ---------------------------
-app = FastAPI(title="MarkItDown API", version="5.0-no-ocr")
+app = FastAPI(title="MarkItDown API", version="5.1-ui-preview")
 
 app.add_middleware(
     CORSMiddleware,
@@ -84,16 +84,11 @@ def _md_cleanup(md: str) -> str:
         l = re.sub(r"^\s*(\d+)[\)\]]\s+", r"\1. ", l)
         lines.append(l)
     txt = "\n".join(lines)
-    
-    # Note : L'encapsulation automatique dans ```text``` a été supprimée ici 
-    # pour éviter les faux positifs sur les listes ou le texte brut.
-    
     return txt.strip()
 
 def _remove_headers_footers(md_lines: List[str]) -> List[str]:
     """
     Supprime les en-têtes et pieds de page répétés sur plusieurs pages.
-    Prend une liste de chaînes (une chaîne par page).
     """
     if len(md_lines) < 2:
         return md_lines
@@ -116,17 +111,14 @@ def _remove_headers_footers(md_lines: List[str]) -> List[str]:
     for line in last_lines:
         footer_counts[line] = footer_counts.get(line, 0) + 1
 
-    # Seuil : si un texte apparait sur plus de 50% des pages
     headers_to_remove = {line for line, count in header_counts.items() if count >= 2 and count >= 0.5 * len(md_lines)}
     footers_to_remove = {line for line, count in footer_counts.items() if count >= 2 and count >= 0.5 * len(md_lines)}
 
     cleaned_pages = []
     for content in md_lines:
         lines = content.splitlines()
-        # Retire header
         if lines and lines[0].strip() and lines[0] in headers_to_remove:
             lines = lines[1:]
-        # Retire footer
         if lines and lines[-1].strip() and lines[-1] in footers_to_remove:
             lines = lines[:-1]
         cleaned_pages.append("\n".join(lines).strip())
@@ -145,7 +137,6 @@ def _pil_resize_max(im: Image.Image, max_w: int) -> Image.Image:
 
 def _pil_to_base64(im: Image.Image, fmt: str = "png", quality: int = 85) -> str:
     buf = io.BytesIO()
-    # Normalisation format
     fmt = fmt.lower()
     if fmt in ("jpg", "jpeg"):
         im = im.convert("RGB")
@@ -158,7 +149,6 @@ def _pil_to_base64(im: Image.Image, fmt: str = "png", quality: int = 85) -> str:
     return f"data:{mime};base64,{b64}"
 
 def _crop_bbox_image(page: fitz.Page, bbox: Tuple[float, float, float, float], dpi: int = 200) -> Optional[Image.Image]:
-    """Capture une région de la page PDF comme image."""
     try:
         x0, y0, x1, y1 = bbox
         rect = fitz.Rect(x0, y0, x1, y1)
@@ -199,31 +189,19 @@ def _inject_full_data_uris_into_markdown(md: str, data_uris: List[str], alt_pref
 # Traitement DOCX (via Mammoth)
 # ---------------------------
 def render_docx_markdown(docx_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
-    """
-    Convertit DOCX -> HTML (avec mammoth pour images base64) -> Markdown
-    """
     try:
-        # 1. Convertir DOCX en HTML avec images intégrées
         result = mammoth.convert_to_html(io.BytesIO(docx_bytes))
         html_content = result.value
         messages = result.messages
         
-        # 2. Pipeline HTML standard
-        # On extrait les images base64 générées par mammoth
         data_uris = _extract_html_data_imgs(html_content)
         
-        # 3. Conversion HTML -> Markdown via MarkItDown
         md_engine = MarkItDown()
-        # On passe le HTML comme un flux
         res_md = md_engine.convert_stream(io.BytesIO(html_content.encode('utf-8')), file_extension=".html")
         markdown = getattr(res_md, "text_content", "") or ""
 
-        # 4. Réinjection et nettoyage
         markdown = _html_img_datauri_to_markdown(markdown)
         markdown = _inject_full_data_uris_into_markdown(markdown, data_uris, IMG_ALT_PREFIX)
-        
-        # Mammoth ne génère pas de pages séparées, donc le cleanup header/footer est moins pertinent ici
-        # sauf s'il y a des motifs répétés dans le flux.
         markdown = _md_cleanup(markdown)
 
         meta = {"engine": "mammoth+markitdown", "messages": [m.message for m in messages]}
@@ -276,8 +254,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes, meta_out: Dict[str, Any]) -> st
                 btype = b.get("type", 0)
                 bbox = b.get("bbox")
                 
-                # --- TYPE 0: TEXTE ---
-                if btype == 0:
+                if btype == 0: # TEXTE
                     block_text_parts = []
                     block_max_size = 0.0
                     block_bold = False
@@ -297,32 +274,25 @@ def render_pdf_markdown_inline(pdf_bytes: bytes, meta_out: Dict[str, Any]) -> st
                             
                     if block_text_parts:
                         full_block = " ".join(block_text_parts)
-                        # Detection Titre
                         h = _classify_heading(block_max_size, median_size, block_bold)
                         if h:
                             full_block = f"{h} {full_block}"
                         page_content.append((bbox[1], full_block))
 
-                # --- TYPE 1: IMAGE ---
-                elif btype == 1:
-                    # On capture l'image telle qu'elle apparait sur la page (préserve le layout)
-                    im = _crop_bbox_image(page, bbox, dpi=300) # 300 DPI pour bonne qualité
+                elif btype == 1: # IMAGE
+                    im = _crop_bbox_image(page, bbox, dpi=300)
                     if im:
                         im = _pil_resize_max(im, IMG_MAX_WIDTH)
                         data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
                         md_img = f'\n![{IMG_ALT_PREFIX} – page {p+1}]({data_uri})\n'
                         page_content.append((bbox[1], md_img))
 
-            # Tri par position verticale (haut en bas)
             page_content.sort(key=lambda x: x[0])
-            
-            # Assemblage page
             page_md = "\n\n".join([item[1] for item in page_content])
             md_pages.append(page_md)
 
-        # Nettoyage Header/Footer
         cleaned_pages = _remove_headers_footers(md_pages)
-        final_md = "\n\n---\n\n".join(cleaned_pages) # Séparateur de page
+        final_md = "\n\n---\n\n".join(cleaned_pages)
         return _md_cleanup(final_md)
 
     except Exception as e:
@@ -332,7 +302,7 @@ def render_pdf_markdown_inline(pdf_bytes: bytes, meta_out: Dict[str, Any]) -> st
         doc.close()
 
 # ---------------------------
-# UI
+# UI (Mise à jour avec Split View)
 # ---------------------------
 HTML_PAGE = r'''<!doctype html>
 <html lang="fr">
@@ -340,6 +310,8 @@ HTML_PAGE = r'''<!doctype html>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>MarkItDown</title>
+  <!-- Librairie légère pour le rendu Markdown en direct -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
     :root{
       color-scheme: dark;
@@ -347,61 +319,131 @@ HTML_PAGE = r'''<!doctype html>
       --border: #374151; --muted: #9ca3af;
     }
     body{ font-family: -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 2rem; line-height: 1.5; }
-    .container { max-width: 900px; margin: 0 auto; }
-    h1 { font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem; background: linear-gradient(90deg, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    .desc { color: var(--muted); margin-bottom: 2rem; }
+    .container { max-width: 1400px; margin: 0 auto; }
+    
+    h1 { font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem; background: linear-gradient(90deg, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; text-align: center; }
+    .desc { color: var(--muted); margin-bottom: 2rem; text-align: center; }
+    
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
-    .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
     
-    input[type="file"] { file-selector-button { background: var(--border); color: var(--text); border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; transition: background 0.2s; } file-selector-button:hover { background: #4b5563; } }
+    /* Zone de glisser-déposer */
+    #dropzone { border: 2px dashed var(--border); border-radius: 12px; padding: 2rem; text-align: center; color: var(--muted); cursor: pointer; transition: border 0.2s; }
+    #dropzone.dragover { border-color: var(--accent); background: rgba(59, 130, 246, 0.1); }
     
+    /* Contrôles */
+    .controls { display: flex; gap: 1rem; justify-content: center; margin-top: 1.5rem; flex-wrap: wrap; }
     button { background: var(--accent); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
     button:hover { background: var(--accent-hover); transform: translateY(-1px); }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
     button.ghost:hover { background: var(--border); }
-
-    textarea { width: 100%; height: 400px; background: #111827; border: 1px solid var(--border); color: #e5e7eb; border-radius: 8px; padding: 1rem; font-family: 'Menlo', monospace; font-size: 0.9rem; resize: vertical; }
     
-    .stats { display: flex; gap: 1rem; font-size: 0.85rem; color: var(--muted); margin-top: 0.5rem; }
+    .stats { display: flex; gap: 1rem; font-size: 0.85rem; color: var(--muted); justify-content: center; margin-top: 1rem; }
     .pill { background: rgba(255,255,255,0.05); padding: 2px 8px; border-radius: 99px; }
+
+    /* Grille d'édition */
+    .editor-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1.5rem;
+        height: 70vh;
+    }
     
-    #dropzone { border: 2px dashed var(--border); border-radius: 12px; padding: 2rem; text-align: center; color: var(--muted); cursor: pointer; transition: border 0.2s; }
-    #dropzone.dragover { border-color: var(--accent); background: rgba(59, 130, 246, 0.1); }
+    .column { display: flex; flex-direction: column; gap: 0.5rem; }
+    .column h3 { margin: 0; font-size: 1rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+
+    /* Zones de texte et prévisualisation */
+    textarea, #preview {
+        flex: 1;
+        width: 100%;
+        background: #0f1319;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 1rem;
+        font-family: 'Menlo', monospace;
+        font-size: 0.9rem;
+        resize: none;
+        overflow-y: auto;
+    }
+    
+    textarea { color: #e5e7eb; outline: none; transition: border 0.2s; }
+    textarea:focus { border-color: var(--accent); }
+
+    /* Styles pour le rendu Markdown */
+    #preview { background: #1f2937; color: #d1d5db; font-family: -apple-system, system-ui, sans-serif; line-height: 1.6; }
+    #preview img { max-width: 100%; height: auto; border-radius: 4px; margin: 1rem 0; box-shadow: 0 4px 6px rgba(0,0,0,0.2); }
+    #preview h1, #preview h2, #preview h3 { color: #f3f4f6; margin-top: 1.5em; margin-bottom: 0.5em; line-height: 1.2; }
+    #preview h1 { border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }
+    #preview code { background: rgba(255,255,255,0.1); padding: 0.2em 0.4em; border-radius: 4px; font-family: monospace; font-size: 0.85em; }
+    #preview pre { background: #111827; padding: 1em; border-radius: 6px; overflow-x: auto; margin: 1em 0; }
+    #preview pre code { background: transparent; padding: 0; }
+    #preview blockquote { border-left: 4px solid var(--accent); margin: 1em 0; padding-left: 1em; color: var(--muted); }
+    #preview table { width: 100%; border-collapse: collapse; margin: 1em 0; }
+    #preview th, #preview td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+    #preview th { background: rgba(255,255,255,0.05); }
+    #preview hr { border: 0; border-top: 1px solid var(--border); margin: 2rem 0; }
+
+    @media (max-width: 768px) { .editor-grid { grid-template-columns: 1fr; height: auto; } textarea, #preview { height: 500px; } }
   </style>
 </head>
 <body>
   <div class="container">
-    <div style="text-align:center">
-      <h1>MarkItDown</h1>
-      <div class="desc">Convertisseur universel vers Markdown (PDF, DOCX, HTML, Images)</div>
-    </div>
+    <h1>MarkItDown</h1>
+    <div class="desc">Convertisseur PDF / DOCX / HTML / Image vers Markdown</div>
 
     <div class="card">
       <div id="dropzone">Glissez votre fichier ici ou cliquez pour parcourir</div>
       <input type="file" id="file" style="display:none" />
       
-      <div class="row" style="margin-top: 1.5rem; justify-content: center;">
+      <div class="controls">
         <button id="convert">Convertir le document</button>
         <button id="download" class="ghost" style="display:none">Télécharger .md</button>
-        <button id="copy" class="ghost">Copier</button>
+        <button id="copy" class="ghost">Copier le code</button>
       </div>
       
-      <div class="stats" style="justify-content: center;">
-        <span class="pill" id="status">Prêt</span>
+      <div class="stats">
+        <span class="pill" id="status">En attente de fichier...</span>
         <span class="pill">Temps: <span id="timer">0s</span></span>
       </div>
     </div>
 
-    <div class="card">
-      <textarea id="output" spellcheck="false" placeholder="Le résultat Markdown apparaîtra ici..."></textarea>
+    <div class="editor-grid">
+      <div class="column">
+        <h3>Code Markdown</h3>
+        <textarea id="output" spellcheck="false" placeholder="Le code Markdown apparaîtra ici..."></textarea>
+      </div>
+      <div class="column">
+        <h3>Rendu Visuel</h3>
+        <div id="preview">
+            <div style="color: var(--muted); text-align: center; margin-top: 2rem;">
+                La prévisualisation apparaîtra ici.
+            </div>
+        </div>
+      </div>
     </div>
   </div>
 
 <script>
 const $ = id => document.getElementById(id);
-const dz = $("dropzone"), inp = $("file");
+const dz = $("dropzone"), inp = $("file"), out = $("output"), prev = $("preview");
 
+// Setup Marked (Optionnel: configuration)
+marked.use({ breaks: true, gfm: true });
+
+// Mise à jour de la prévisualisation
+function updatePreview() {
+    const md = out.value;
+    if(!md.trim()) {
+        prev.innerHTML = '<div style="color: var(--muted); text-align: center; margin-top: 2rem;">La prévisualisation apparaîtra ici.</div>';
+    } else {
+        prev.innerHTML = marked.parse(md);
+    }
+}
+
+// Écouteur pour la frappe en direct
+out.addEventListener("input", updatePreview);
+
+// Drag & Drop
 dz.onclick = () => inp.click();
 dz.ondragover = e => { e.preventDefault(); dz.classList.add("dragover"); };
 dz.ondragleave = () => dz.classList.remove("dragover");
@@ -410,7 +452,8 @@ inp.onchange = () => { if(inp.files[0]) handleFile(inp.files[0]); };
 
 function handleFile(f) {
     inp.files = createFileList(f);
-    $("status").innerText = "Fichier: " + f.name;
+    $("status").innerText = "Fichier sélectionné : " + f.name;
+    $("convert").disabled = false;
 }
 
 function createFileList(file) {
@@ -423,9 +466,8 @@ $("convert").onclick = async () => {
     
     const btn = $("convert");
     btn.disabled = true;
-    btn.innerText = "Conversion...";
-    $("status").innerText = "Traitement en cours...";
-    $("output").value = "";
+    btn.innerText = "Traitement...";
+    $("status").innerText = "Conversion en cours...";
     
     const t0 = performance.now();
     const fd = new FormData();
@@ -434,15 +476,14 @@ $("convert").onclick = async () => {
     try {
         const res = await fetch("/convert", { method: "POST", body: fd });
         const json = await res.json();
-        
         const t1 = performance.now();
         $("timer").innerText = ((t1-t0)/1000).toFixed(2) + "s";
         
         if(res.ok) {
-            $("output").value = json.markdown;
-            $("status").innerText = "Terminé avec succès";
+            out.value = json.markdown;
+            updatePreview(); // Déclenche le rendu visuel
             
-            // Setup download
+            $("status").innerText = "Terminé !";
             const blob = new Blob([json.markdown], {type: "text/markdown"});
             const url = URL.createObjectURL(blob);
             const dl = $("download");
@@ -454,12 +495,12 @@ $("convert").onclick = async () => {
                 a.click();
             };
         } else {
-            $("output").value = "Erreur: " + JSON.stringify(json, null, 2);
+            out.value = "Erreur: " + JSON.stringify(json, null, 2);
             $("status").innerText = "Erreur serveur";
         }
     } catch(e) {
         $("status").innerText = "Erreur réseau";
-        $("output").value = e.toString();
+        out.value = e.toString();
     } finally {
         btn.disabled = false;
         btn.innerText = "Convertir le document";
@@ -467,7 +508,7 @@ $("convert").onclick = async () => {
 };
 
 $("copy").onclick = () => {
-    navigator.clipboard.writeText($("output").value);
+    navigator.clipboard.writeText(out.value);
     const old = $("copy").innerText;
     $("copy").innerText = "Copié !";
     setTimeout(() => $("copy").innerText = old, 2000);
@@ -497,35 +538,24 @@ async def convert(file: UploadFile = File(...)):
         metadata = {"type": ftype}
         markdown = ""
 
-        # --- ROUTAGE SELON TYPE ---
-        
-        # 1. PDF : Traitement custom (Structure + Image Base64)
         if ftype == "pdf":
             markdown = render_pdf_markdown_inline(content, metadata)
 
-        # 2. DOCX : Traitement custom (Mammoth -> HTML -> Markdown)
         elif ftype == "docx":
             md_docx, meta_docx = render_docx_markdown(content)
             markdown = md_docx
             metadata.update(meta_docx)
 
-        # 3. HTML : MarkItDown + Réinjection Base64
         elif ftype == "html":
             html_text = content.decode("utf-8", errors="ignore")
-            # Extraction images
             data_uris = _extract_html_data_imgs(html_text)
-            
-            # Conversion
             md_engine = MarkItDown()
             res = md_engine.convert_stream(io.BytesIO(content), file_extension=".html")
             markdown = getattr(res, "text_content", "") or ""
-            
-            # Réinjection
             markdown = _html_img_datauri_to_markdown(markdown)
             markdown = _inject_full_data_uris_into_markdown(markdown, data_uris, IMG_ALT_PREFIX)
             markdown = _md_cleanup(markdown)
 
-        # 4. Images brutes : Conversion en markdown image
         elif ftype == "image":
             try:
                 with Image.open(io.BytesIO(content)) as im:
@@ -535,21 +565,17 @@ async def convert(file: UploadFile = File(...)):
             except Exception as e:
                 markdown = f"Erreur image: {e}"
 
-        # 5. Autres (txt, etc) : MarkItDown standard
         else:
             md_engine = MarkItDown()
-            # On tente une conversion générique
             try:
                 res = md_engine.convert_stream(io.BytesIO(content), file_extension=os.path.splitext(file.filename)[1])
                 markdown = getattr(res, "text_content", "") or ""
             except:
-                # Fallback texte brut
                 try:
                     markdown = content.decode("utf-8")
                 except:
                     markdown = "Format non supporté et non lisible."
 
-        # Sauvegarde Sortie
         out_name = f"{os.path.splitext(file.filename)[0]}.md"
         if SAVE_OUTPUTS:
             with open(os.path.join(OUTPUT_DIR, out_name), "w", encoding="utf-8") as f:
