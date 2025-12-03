@@ -471,7 +471,7 @@ HTML_PAGE = r'''<!doctype html>
       </div>
       
       <div class="card" style="flex:1; justify-content:center; align-items:center; text-align:center; opacity:0.5">
-        <small>Powered by MarkItDown<br>&copy; 2025</small>
+        <small>Powered by oXya<br>&copy; 2025-2026</small>
       </div>
     </aside>
 
