@@ -347,31 +347,53 @@ def _vertical_gap(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     return max(0.0, b["y0"] - a["y1"])
 
 
+def _find_pdf_target_group(groups: List[Dict[str, Any]], block: Dict[str, Any]) -> Optional[int]:
+    best_idx: Optional[int] = None
+    best_score: Optional[Tuple[float, float, float]] = None
+
+    for idx, group in enumerate(groups):
+        if not _same_column(group, block):
+            continue
+
+        gap = block["y0"] - group["y1"]
+        if gap < -2.0:
+            continue
+
+        max_gap = max(26.0, min(group["y1"] - group["y0"], block["y1"] - block["y0"]) * 1.2)
+        if gap > max_gap:
+            continue
+
+        overlap = _horizontal_overlap_ratio(group, block)
+        center_gap = abs(((group["x0"] + group["x1"]) / 2.0) - ((block["x0"] + block["x1"]) / 2.0))
+        score = (gap, center_gap, -overlap)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_idx = idx
+
+    return best_idx
+
+
 def _merge_pdf_text_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not blocks:
         return []
 
     ordered = sorted(blocks, key=lambda b: (round(b["y0"] / 4), b["x0"], b["y1"], b["x1"]))
-    merged: List[Dict[str, Any]] = []
+    groups: List[Dict[str, Any]] = []
+
     for block in ordered:
-        if not merged:
-            merged.append(dict(block))
+        idx = _find_pdf_target_group(groups, block)
+        if idx is None:
+            groups.append(dict(block))
             continue
 
-        prev = merged[-1]
-        gap = _vertical_gap(prev, block)
-        max_gap = max(18.0, min(prev["y1"] - prev["y0"], block["y1"] - block["y0"]) * 0.9)
-        can_merge = _same_column(prev, block) and gap <= max_gap
+        group = groups[idx]
+        group["text"] = _normalize_text_spacing(f"{group['text']} {block['text']}")
+        group["x0"] = min(group["x0"], block["x0"])
+        group["y0"] = min(group["y0"], block["y0"])
+        group["x1"] = max(group["x1"], block["x1"])
+        group["y1"] = max(group["y1"], block["y1"])
 
-        if can_merge:
-            prev["text"] = _normalize_text_spacing(f"{prev['text']} {block['text']}")
-            prev["x0"] = min(prev["x0"], block["x0"])
-            prev["y0"] = min(prev["y0"], block["y0"])
-            prev["x1"] = max(prev["x1"], block["x1"])
-            prev["y1"] = max(prev["y1"], block["y1"])
-        else:
-            merged.append(dict(block))
-    return merged
+    return sorted(groups, key=lambda g: (round(g["y0"] / 6), g["x0"], g["y1"], g["x1"]))
 
 
 def _extract_pdf_image_blocks(page: fitz.Page, raw: Dict[str, Any], page_index: int) -> List[Dict[str, Any]]:
