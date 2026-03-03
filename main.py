@@ -257,6 +257,147 @@ def render_docx_markdown(content: bytes) -> Tuple[str, Dict]:
         return _md_cleanup(md), {"messages": [m.message for m in res.messages]}
     except Exception as e: return f"Erreur DOCX: {e}", {"error": str(e)}
 
+def _normalize_text_spacing(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"[ 	]+", " ", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    text = re.sub(r"([\[(])\s+", r"\1", text)
+    text = re.sub(r"\s+([\])])", r"\1", text)
+    return text.strip()
+
+
+def _extract_pdf_text_blocks(raw: Dict[str, Any], median: float) -> List[Dict[str, Any]]:
+    blocks = []
+    for b in raw.get("blocks", []):
+        if b.get("type") != 0:
+            continue
+        bbox = b.get("bbox")
+        if not bbox:
+            continue
+
+        block_lines = []
+        max_s = 0.0
+        is_bold = False
+        lines = sorted(
+            b.get("lines", []),
+            key=lambda l: (
+                round(((l.get("bbox") or [0, 0, 0, 0])[1]) / 2),
+                round((l.get("bbox") or [0, 0, 0, 0])[0], 1),
+            ),
+        )
+        for line in lines:
+            spans = sorted(
+                line.get("spans", []),
+                key=lambda s: (
+                    round((s.get("bbox") or [0, 0, 0, 0])[0], 1),
+                    round((s.get("bbox") or [0, 0, 0, 0])[1], 1),
+                ),
+            )
+            line_parts = []
+            prev_x1 = None
+            for s in spans:
+                t = (s.get("text") or "")
+                if not t.strip():
+                    continue
+                s_bbox = s.get("bbox") or [0, 0, 0, 0]
+                x0, x1 = s_bbox[0], s_bbox[2]
+                if prev_x1 is not None and x0 - prev_x1 > max(3.0, float(s.get("size", 0.0)) * 0.15):
+                    line_parts.append(" ")
+                max_s = max(max_s, float(s.get("size", 0.0)))
+                flags = int(s.get("flags", 0))
+                is_bold = is_bold or _is_bold(flags)
+                line_parts.append(f"**{t}**" if _is_bold(flags) else t)
+                prev_x1 = x1
+            line_text = _normalize_text_spacing("".join(line_parts))
+            if line_text:
+                block_lines.append(line_text)
+
+        full = _normalize_text_spacing(" ".join(block_lines))
+        if not full:
+            continue
+
+        h = _classify_heading(max_s, median, is_bold)
+        blocks.append({
+            "type": "text",
+            "x0": float(bbox[0]),
+            "y0": float(bbox[1]),
+            "x1": float(bbox[2]),
+            "y1": float(bbox[3]),
+            "text": f"{h} {full}" if h else full,
+        })
+    return blocks
+
+
+def _horizontal_overlap_ratio(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    overlap = max(0.0, min(a["x1"], b["x1"]) - max(a["x0"], b["x0"]))
+    width = max(1.0, min(a["x1"] - a["x0"], b["x1"] - b["x0"]))
+    return overlap / width
+
+
+def _same_column(a: Dict[str, Any], b: Dict[str, Any], x_tol: float = 36.0, overlap_ratio: float = 0.35) -> bool:
+    a_center = (a["x0"] + a["x1"]) / 2.0
+    b_center = (b["x0"] + b["x1"]) / 2.0
+    left_close = abs(a["x0"] - b["x0"]) <= x_tol
+    center_close = abs(a_center - b_center) <= max(x_tol, min(a["x1"] - a["x0"], b["x1"] - b["x0"]) * 0.2)
+    return left_close or center_close or _horizontal_overlap_ratio(a, b) >= overlap_ratio
+
+
+def _vertical_gap(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    return max(0.0, b["y0"] - a["y1"])
+
+
+def _merge_pdf_text_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not blocks:
+        return []
+
+    ordered = sorted(blocks, key=lambda b: (round(b["y0"] / 4), b["x0"], b["y1"], b["x1"]))
+    merged: List[Dict[str, Any]] = []
+    for block in ordered:
+        if not merged:
+            merged.append(dict(block))
+            continue
+
+        prev = merged[-1]
+        gap = _vertical_gap(prev, block)
+        max_gap = max(18.0, min(prev["y1"] - prev["y0"], block["y1"] - block["y0"]) * 0.9)
+        can_merge = _same_column(prev, block) and gap <= max_gap
+
+        if can_merge:
+            prev["text"] = _normalize_text_spacing(f"{prev['text']} {block['text']}")
+            prev["x0"] = min(prev["x0"], block["x0"])
+            prev["y0"] = min(prev["y0"], block["y0"])
+            prev["x1"] = max(prev["x1"], block["x1"])
+            prev["y1"] = max(prev["y1"], block["y1"])
+        else:
+            merged.append(dict(block))
+    return merged
+
+
+def _extract_pdf_image_blocks(page: fitz.Page, raw: Dict[str, Any], page_index: int) -> List[Dict[str, Any]]:
+    items = []
+    for b in raw.get("blocks", []):
+        if b.get("type") != 1:
+            continue
+        bbox = b.get("bbox")
+        if not bbox:
+            continue
+        im = _crop_bbox_image(page, bbox, 300)
+        if not im:
+            continue
+        im = _pil_resize_max(im, IMG_MAX_WIDTH)
+        uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+        items.append({
+            "type": "image",
+            "x0": float(bbox[0]),
+            "y0": float(bbox[1]),
+            "x1": float(bbox[2]),
+            "y1": float(bbox[3]),
+            "text": f"\n![{IMG_ALT_PREFIX} – page {page_index}]({uri})\n",
+        })
+    return items
+
+
 def render_pdf_markdown_inline(content: bytes, meta: Dict) -> str:
     doc = fitz.open(stream=content, filetype="pdf")
     meta["pages"] = doc.page_count
@@ -264,37 +405,21 @@ def render_pdf_markdown_inline(content: bytes, meta: Dict) -> str:
     try:
         for p in range(doc.page_count):
             page = doc.load_page(p)
-            raw = page.get_text("dict") or {}
+            raw = page.get_text("dict", sort=False) or {}
             median = _median_font_size(raw)
-            items = []
-            for b in raw.get("blocks", []):
-                bbox = b.get("bbox")
-                if b["type"] == 0:
-                    block_txt = []
-                    max_s, is_bold = 0.0, False
-                    for l in b["lines"]:
-                        line_parts = []
-                        for s in l["spans"]:
-                            t = s["text"]
-                            if not t.strip(): continue
-                            max_s = max(max_s, s["size"]); is_bold = is_bold or _is_bold(s["flags"])
-                            line_parts.append(f"**{t}**" if _is_bold(s["flags"]) else t)
-                        if line_parts: block_txt.append("".join(line_parts))
-                    if block_txt:
-                        full = " ".join(block_txt)
-                        h = _classify_heading(max_s, median, is_bold)
-                        items.append((bbox[1], f"{h} {full}" if h else full))
-                elif b["type"] == 1:
-                    im = _crop_bbox_image(page, bbox, 300)
-                    if im:
-                        im = _pil_resize_max(im, IMG_MAX_WIDTH)
-                        uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
-                        items.append((bbox[1], f"\n![{IMG_ALT_PREFIX} – page {p+1}]({uri})\n"))
-            items.sort(key=lambda x: x[0])
-            md_pages.append("\n\n".join([x[1] for x in items]))
+
+            text_blocks = _merge_pdf_text_blocks(_extract_pdf_text_blocks(raw, median))
+            image_blocks = _extract_pdf_image_blocks(page, raw, p + 1)
+            items = sorted(
+                text_blocks + image_blocks,
+                key=lambda item: (round(item["y0"] / 6), item["x0"], item["y1"], item["x1"]),
+            )
+            md_pages.append("\n\n".join(item["text"] for item in items if item.get("text")))
+
         cleaned = _remove_headers_footers(md_pages)
         return _md_cleanup("\n\n---\n\n".join(cleaned))
-    finally: doc.close()
+    finally:
+        doc.close()
 
 # PDF Utils
 def _is_bold(flags): return bool(flags & 1 or flags & 32)
