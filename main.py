@@ -5,10 +5,12 @@ import time
 import base64
 import json
 import traceback
+import uuid
+import hashlib
 from typing import Optional, Tuple, List, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # Librairie Microsoft MarkItDown
@@ -36,16 +38,20 @@ SAVE_UPLOADS  = os.getenv("SAVE_UPLOADS", "false").lower() == "true"
 SAVE_OUTPUTS  = os.getenv("SAVE_OUTPUTS", "false").lower() == "true"
 UPLOAD_DIR    = os.getenv("UPLOAD_DIR", "/data/uploads")
 OUTPUT_DIR    = os.getenv("OUTPUT_DIR", "/data/outputs")
+IMAGE_OUTPUT_DIR = os.getenv("IMAGE_OUTPUT_DIR", os.path.join(OUTPUT_DIR, "images"))
+IMAGE_PUBLIC_BASE_URL = os.getenv("IMAGE_PUBLIC_BASE_URL", "").strip().rstrip("/")
 
-# Intégration images base64
+# Images
 IMG_FORMAT         = os.getenv("IMG_FORMAT", "png").strip().lower()
 IMG_JPEG_QUALITY   = int(os.getenv("IMG_JPEG_QUALITY", "85"))
 IMG_MAX_WIDTH      = int(os.getenv("IMG_MAX_WIDTH", "1400"))
 IMG_ALT_PREFIX     = os.getenv("IMG_ALT_PREFIX", "Capture").strip()
+MARKDOWN_INLINE_IMAGES = os.getenv("MARKDOWN_INLINE_IMAGES", "true").lower() in ("1", "true", "yes", "on")
 
 # Dossiers persistents
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(IMAGE_OUTPUT_DIR, exist_ok=True)
 
 # ---------------------------
 # App FastAPI
@@ -92,6 +98,101 @@ def _md_cleanup(md: str) -> str:
         lines.append(l)
     return "\n".join(lines).strip()
 
+def _safe_slug(value: str, fallback: str = "item") -> str:
+    s = re.sub(r"[^a-zA-Z0-9._-]+", "-", value or "").strip("-._")
+    return s[:120] or fallback
+
+def _parse_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+def _mime_ext(mime: str, fallback_fmt: str = "png") -> str:
+    mime = (mime or "").lower()
+    if "jpeg" in mime or "jpg" in mime:
+        return "jpg"
+    if "webp" in mime:
+        return "webp"
+    if "gif" in mime:
+        return "gif"
+    if "bmp" in mime:
+        return "bmp"
+    if "tiff" in mime:
+        return "tiff"
+    return "jpg" if fallback_fmt in ("jpg", "jpeg") else "png"
+
+def _image_public_url(conversion_id: str, filename: str) -> str:
+    rel = f"/images/{conversion_id}/{filename}"
+    return f"{IMAGE_PUBLIC_BASE_URL}{rel}" if IMAGE_PUBLIC_BASE_URL else rel
+
+def _encode_image_bytes(im: Image.Image, fmt: str = "png", quality: int = 85) -> Tuple[bytes, str, str]:
+    buf = io.BytesIO()
+    fmt = (fmt or "png").lower()
+    if fmt in ("jpg", "jpeg"):
+        im = im.convert("RGB")
+        im.save(buf, format="JPEG", quality=quality, optimize=True)
+        return buf.getvalue(), "image/jpeg", "jpg"
+    im.save(buf, format="PNG", optimize=True)
+    return buf.getvalue(), "image/png", "png"
+
+def _save_image_asset(
+    im: Image.Image,
+    *,
+    conversion_id: str,
+    source_filename: str,
+    image_index: int,
+    page: Optional[int] = None,
+    section_title: Optional[str] = None,
+    caption: Optional[str] = None,
+    context_before: str = "",
+    context_after: str = "",
+    bbox: Optional[Tuple[float, float, float, float]] = None,
+) -> Dict[str, Any]:
+    im = _pil_resize_max(im, IMG_MAX_WIDTH)
+    data, mime, ext = _encode_image_bytes(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    source_slug = _safe_slug(os.path.splitext(os.path.basename(source_filename or "document"))[0], "document")
+    page_part = f"p{int(page):03d}" if page else "p000"
+    image_id = f"{source_slug}_{page_part}_img{image_index:03d}_{digest}"
+    filename = f"{image_id}.{ext}"
+    out_dir = os.path.join(IMAGE_OUTPUT_DIR, _safe_slug(conversion_id, "conversion"))
+    os.makedirs(out_dir, exist_ok=True)
+    storage_path = os.path.join(out_dir, filename)
+    with open(storage_path, "wb") as f:
+        f.write(data)
+
+    nearby = _normalize_text_spacing(" ".join([context_before or "", caption or "", context_after or ""]))
+    return {
+        "image_id": image_id,
+        "image_index": image_index,
+        "page": page,
+        "section_title": section_title,
+        "caption": caption or "",
+        "context_before": context_before or "",
+        "context_after": context_after or "",
+        "context_nearby": nearby,
+        "mime_type": mime,
+        "width": im.width,
+        "height": im.height,
+        "storage_path": storage_path,
+        "relative_url": f"/images/{conversion_id}/{filename}",
+        "public_url": _image_public_url(conversion_id, filename),
+        "bbox": list(bbox) if bbox else None,
+        "content_sha256": digest,
+    }
+
+def _data_uri_to_image(data_uri: str) -> Optional[Tuple[Image.Image, str]]:
+    if not data_uri:
+        return None
+    m = re.match(r"^data:(image/[^;]+);base64,(.+)$", data_uri, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+    try:
+        raw = base64.b64decode(m.group(2), validate=False)
+        return Image.open(io.BytesIO(raw)).copy(), m.group(1).lower()
+    except Exception:
+        return None
+
 def _remove_headers_footers(md_lines: List[str]) -> List[str]:
     if len(md_lines) < 2: return md_lines
     first_lines, last_lines = [], []
@@ -137,6 +238,11 @@ def _pil_to_base64(im: Image.Image, fmt: str = "png", quality: int = 85) -> str:
         mime = "image/png"
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:{mime};base64,{b64}"
+
+def _image_markdown(asset: Dict[str, Any], inline_images: bool, data_uri: Optional[str] = None) -> str:
+    alt = asset.get("caption") or f"{IMG_ALT_PREFIX} {asset.get('image_index', '')}".strip()
+    src = data_uri if inline_images and data_uri else asset.get("public_url") or asset.get("relative_url") or ""
+    return f"![{alt}]({src})" if src else ""
 
 def _crop_bbox_image(page: fitz.Page, bbox: Tuple[float, float, float, float], dpi: int = 200) -> Optional[Image.Image]:
     try:
@@ -213,10 +319,12 @@ def render_json_markdown(content: bytes) -> str:
     except json.JSONDecodeError:
         return "```text\n(Fichier JSON invalide)\n```"
 
-def render_pptx_markdown(content: bytes) -> str:
+def render_pptx_markdown(content: bytes, source_filename: str, conversion_id: str, inline_images: bool = False) -> Tuple[str, List[Dict[str, Any]]]:
     try:
         prs = Presentation(io.BytesIO(content))
         md_slides = []
+        images: List[Dict[str, Any]] = []
+        image_index = 0
         for i, slide in enumerate(prs.slides):
             slide_content = []
             if slide.shapes.title:
@@ -236,26 +344,59 @@ def render_pptx_markdown(content: bytes) -> str:
                     try:
                         image_blob = shape.image.blob
                         with Image.open(io.BytesIO(image_blob)) as im:
-                            im = _pil_resize_max(im, IMG_MAX_WIDTH)
-                            data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
-                            slide_content.append(f"![{IMG_ALT_PREFIX} – Slide {i+1}]({data_uri})")
+                            image_index += 1
+                            caption = f"{IMG_ALT_PREFIX} - slide {i+1}"
+                            before = "\n".join(slide_content[-3:])
+                            asset = _save_image_asset(
+                                im,
+                                conversion_id=conversion_id,
+                                source_filename=source_filename,
+                                image_index=image_index,
+                                page=i + 1,
+                                section_title=slide.shapes.title.text.strip() if slide.shapes.title else None,
+                                caption=caption,
+                                context_before=before,
+                            )
+                            images.append(asset)
+                            if inline_images:
+                                data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+                                slide_content.append(_image_markdown(asset, True, data_uri))
                     except Exception: pass
             md_slides.append("\n\n".join(slide_content))
-        return "\n\n---\n\n".join(md_slides)
+        return "\n\n---\n\n".join(md_slides), images
     except Exception as e:
-        return f"Erreur PPTX: {str(e)}"
+        return f"Erreur PPTX: {str(e)}", []
 
-def render_docx_markdown(content: bytes) -> Tuple[str, Dict]:
+def render_docx_markdown(content: bytes, source_filename: str, conversion_id: str, inline_images: bool = False) -> Tuple[str, Dict, List[Dict[str, Any]]]:
     try:
         res = mammoth.convert_to_html(io.BytesIO(content))
         uris = _extract_html_data_imgs(res.value)
+        images: List[Dict[str, Any]] = []
+        replacement_uris: List[str] = []
+        for idx, uri in enumerate(uris, start=1):
+            decoded = _data_uri_to_image(uri)
+            if not decoded:
+                continue
+            im, _mime = decoded
+            asset = _save_image_asset(
+                im,
+                conversion_id=conversion_id,
+                source_filename=source_filename,
+                image_index=idx,
+                caption=f"{IMG_ALT_PREFIX} - image {idx}",
+            )
+            images.append(asset)
+            replacement_uris.append(uri if inline_images else asset.get("public_url") or asset.get("relative_url") or "")
+
         md_eng = MarkItDown()
         out = md_eng.convert_stream(io.BytesIO(res.value.encode('utf-8')), file_extension=".html")
         md = getattr(out, "text_content", "") or ""
         md = _html_img_datauri_to_markdown(md)
-        md = _inject_full_data_uris_into_markdown(md, uris, IMG_ALT_PREFIX)
-        return _md_cleanup(md), {"messages": [m.message for m in res.messages]}
-    except Exception as e: return f"Erreur DOCX: {e}", {"error": str(e)}
+        md = _inject_full_data_uris_into_markdown(md, replacement_uris, IMG_ALT_PREFIX)
+        if not inline_images:
+            md = re.sub(r'!\[[^\]]*\]\([^)]+\)', "", md)
+        return _md_cleanup(md), {"messages": [m.message for m in res.messages]}, images
+    except Exception as e: return f"Erreur DOCX: {e}", {"error": str(e)}, []
 
 def _normalize_text_spacing(text: str) -> str:
     if not text:
@@ -396,8 +537,18 @@ def _merge_pdf_text_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return sorted(groups, key=lambda g: (round(g["y0"] / 6), g["x0"], g["y1"], g["x1"]))
 
 
-def _extract_pdf_image_blocks(page: fitz.Page, raw: Dict[str, Any], page_index: int) -> List[Dict[str, Any]]:
+def _extract_pdf_image_blocks(
+    page: fitz.Page,
+    raw: Dict[str, Any],
+    page_index: int,
+    *,
+    source_filename: str,
+    conversion_id: str,
+    start_index: int = 0,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     items = []
+    images: List[Dict[str, Any]] = []
+    image_index = start_index
     for b in raw.get("blocks", []):
         if b.get("type") != 1:
             continue
@@ -407,23 +558,81 @@ def _extract_pdf_image_blocks(page: fitz.Page, raw: Dict[str, Any], page_index: 
         im = _crop_bbox_image(page, bbox, 300)
         if not im:
             continue
-        im = _pil_resize_max(im, IMG_MAX_WIDTH)
-        uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+        image_index += 1
+        asset = _save_image_asset(
+            im,
+            conversion_id=conversion_id,
+            source_filename=source_filename,
+            image_index=image_index,
+            page=page_index,
+            caption=f"{IMG_ALT_PREFIX} - page {page_index}",
+            bbox=tuple(float(x) for x in bbox),
+        )
+        images.append(asset)
         items.append({
             "type": "image",
             "x0": float(bbox[0]),
             "y0": float(bbox[1]),
             "x1": float(bbox[2]),
             "y1": float(bbox[3]),
-            "text": f"\n![{IMG_ALT_PREFIX} – page {page_index}]({uri})\n",
+            "asset": asset,
+            "text": "",
         })
-    return items
+    return items, images
 
 
-def render_pdf_markdown_inline(content: bytes, meta: Dict) -> str:
+def _current_section_from_text(text: str, current: Optional[str]) -> Optional[str]:
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip() or current
+    return current
+
+
+def _annotate_pdf_image_context(items: List[Dict[str, Any]], inline_images: bool) -> None:
+    current_section: Optional[str] = None
+    for idx, item in enumerate(items):
+        if item.get("type") == "text":
+            current_section = _current_section_from_text(item.get("text") or "", current_section)
+            continue
+        if item.get("type") != "image" or not item.get("asset"):
+            continue
+
+        before_parts = []
+        for prev in reversed(items[:idx]):
+            if prev.get("type") == "text" and prev.get("text"):
+                before_parts.append(prev["text"])
+            if len(before_parts) >= 2:
+                break
+        before = _normalize_text_spacing(" ".join(reversed(before_parts)))[:1200]
+
+        after_parts = []
+        for nxt in items[idx + 1:]:
+            if nxt.get("type") == "text" and nxt.get("text"):
+                after_parts.append(nxt["text"])
+            if len(after_parts) >= 2:
+                break
+        after = _normalize_text_spacing(" ".join(after_parts))[:1200]
+
+        asset = item["asset"]
+        asset["section_title"] = asset.get("section_title") or current_section
+        asset["context_before"] = before
+        asset["context_after"] = after
+        asset["context_nearby"] = _normalize_text_spacing(" ".join([before, asset.get("caption") or "", after]))
+        item["text"] = _image_markdown(asset, inline_images) if inline_images else ""
+
+
+def render_pdf_markdown_inline(
+    content: bytes,
+    meta: Dict,
+    source_filename: str,
+    conversion_id: str,
+    inline_images: bool = False,
+) -> Tuple[str, List[Dict[str, Any]]]:
     doc = fitz.open(stream=content, filetype="pdf")
     meta["pages"] = doc.page_count
     md_pages = []
+    images: List[Dict[str, Any]] = []
     try:
         for p in range(doc.page_count):
             page = doc.load_page(p)
@@ -431,15 +640,24 @@ def render_pdf_markdown_inline(content: bytes, meta: Dict) -> str:
             median = _median_font_size(raw)
 
             text_blocks = _merge_pdf_text_blocks(_extract_pdf_text_blocks(raw, median))
-            image_blocks = _extract_pdf_image_blocks(page, raw, p + 1)
+            image_blocks, page_images = _extract_pdf_image_blocks(
+                page,
+                raw,
+                p + 1,
+                source_filename=source_filename,
+                conversion_id=conversion_id,
+                start_index=len(images),
+            )
+            images.extend(page_images)
             items = sorted(
                 text_blocks + image_blocks,
                 key=lambda item: (round(item["y0"] / 6), item["x0"], item["y1"], item["x1"]),
             )
+            _annotate_pdf_image_context(items, inline_images)
             md_pages.append("\n\n".join(item["text"] for item in items if item.get("text")))
 
         cleaned = _remove_headers_footers(md_pages)
-        return _md_cleanup("\n\n---\n\n".join(cleaned))
+        return _md_cleanup("\n\n---\n\n".join(cleaned)), images
     finally:
         doc.close()
 
@@ -808,8 +1026,18 @@ mdOut.addEventListener("input", updatePreview);
 @app.get("/", response_class=HTMLResponse)
 def index(): return HTMLResponse(HTML_PAGE)
 
+@app.get("/images/{conversion_id}/{filename}")
+def get_converted_image(conversion_id: str, filename: str):
+    safe_conversion = _safe_slug(conversion_id, "conversion")
+    safe_filename = _safe_slug(filename, "image")
+    path = os.path.abspath(os.path.join(IMAGE_OUTPUT_DIR, safe_conversion, safe_filename))
+    root = os.path.abspath(IMAGE_OUTPUT_DIR)
+    if not path.startswith(root + os.sep) or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(path)
+
 @app.post("/convert")
-async def convert(file: UploadFile = File(...)):
+async def convert(file: UploadFile = File(...), inline_images: Optional[str] = Form(None)):
     try:
         t0 = time.perf_counter()
         content = await file.read()
@@ -817,31 +1045,61 @@ async def convert(file: UploadFile = File(...)):
             with open(os.path.join(UPLOAD_DIR, file.filename), "wb") as f: f.write(content)
 
         ftype = guess_file_type(file.filename, file.content_type)
-        meta = {"type": ftype}
+        conversion_id = uuid.uuid4().hex
+        inline = _parse_bool(inline_images, MARKDOWN_INLINE_IMAGES)
+        meta = {"type": ftype, "conversion_id": conversion_id, "inline_images": inline}
+        images: List[Dict[str, Any]] = []
         
         if ftype == "pdf":
-            md = render_pdf_markdown_inline(content, meta)
+            md, images = render_pdf_markdown_inline(content, meta, file.filename, conversion_id, inline)
         elif ftype == "docx":
-            md, m_docx = render_docx_markdown(content)
+            md, m_docx, images = render_docx_markdown(content, file.filename, conversion_id, inline)
             meta.update(m_docx)
         elif ftype == "pptx":
-            md = render_pptx_markdown(content)
+            md, images = render_pptx_markdown(content, file.filename, conversion_id, inline)
         elif ftype == "json":
             md = render_json_markdown(content)
         elif ftype == "html":
             txt = content.decode("utf-8", errors="ignore")
             uris = _extract_html_data_imgs(txt)
+            replacement_uris: List[str] = []
+            for idx, uri in enumerate(uris, start=1):
+                decoded = _data_uri_to_image(uri)
+                if not decoded:
+                    continue
+                im, _mime = decoded
+                asset = _save_image_asset(
+                    im,
+                    conversion_id=conversion_id,
+                    source_filename=file.filename,
+                    image_index=idx,
+                    caption=f"{IMG_ALT_PREFIX} - image {idx}",
+                )
+                images.append(asset)
+                replacement_uris.append(uri if inline else asset.get("public_url") or asset.get("relative_url") or "")
             eng = MarkItDown()
             res = eng.convert_stream(io.BytesIO(content), file_extension=".html")
             md = getattr(res, "text_content", "") or ""
             md = _html_img_datauri_to_markdown(md)
-            md = _inject_full_data_uris_into_markdown(md, uris, IMG_ALT_PREFIX)
+            md = _inject_full_data_uris_into_markdown(md, replacement_uris, IMG_ALT_PREFIX)
+            if not inline:
+                md = re.sub(r'!\[[^\]]*\]\([^)]+\)', "", md)
             md = _md_cleanup(md)
         elif ftype == "image":
             with Image.open(io.BytesIO(content)) as im:
-                im = _pil_resize_max(im, IMG_MAX_WIDTH)
-                uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
-                md = f"![{file.filename}]({uri})"
+                asset = _save_image_asset(
+                    im,
+                    conversion_id=conversion_id,
+                    source_filename=file.filename,
+                    image_index=1,
+                    caption=file.filename,
+                )
+                images = [asset]
+                if inline:
+                    uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY)
+                    md = _image_markdown(asset, True, uri)
+                else:
+                    md = f"Image extraite: {file.filename}"
         else:
             eng = MarkItDown()
             try:
@@ -855,7 +1113,14 @@ async def convert(file: UploadFile = File(...)):
             with open(os.path.join(OUTPUT_DIR, out_name), "w", encoding="utf-8") as f: f.write(md)
 
         meta["duration"] = round(time.perf_counter() - t0, 3)
-        return JSONResponse({"filename": file.filename, "output_filename": out_name, "markdown": md, "metadata": meta})
+        meta["images_count"] = len(images)
+        return JSONResponse({
+            "filename": file.filename,
+            "output_filename": out_name,
+            "markdown": md,
+            "images": images,
+            "metadata": meta,
+        })
 
     except Exception as e:
         traceback.print_exc()
