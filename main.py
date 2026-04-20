@@ -545,6 +545,7 @@ def _extract_pdf_image_blocks(
     source_filename: str,
     conversion_id: str,
     start_index: int = 0,
+    inline_images: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     items = []
     images: List[Dict[str, Any]] = []
@@ -568,6 +569,7 @@ def _extract_pdf_image_blocks(
             caption=f"{IMG_ALT_PREFIX} - page {page_index}",
             bbox=tuple(float(x) for x in bbox),
         )
+        data_uri = _pil_to_base64(im, IMG_FORMAT, IMG_JPEG_QUALITY) if inline_images else None
         images.append(asset)
         items.append({
             "type": "image",
@@ -576,6 +578,7 @@ def _extract_pdf_image_blocks(
             "x1": float(bbox[2]),
             "y1": float(bbox[3]),
             "asset": asset,
+            "data_uri": data_uri,
             "text": "",
         })
     return items, images
@@ -619,7 +622,7 @@ def _annotate_pdf_image_context(items: List[Dict[str, Any]], inline_images: bool
         asset["context_before"] = before
         asset["context_after"] = after
         asset["context_nearby"] = _normalize_text_spacing(" ".join([before, asset.get("caption") or "", after]))
-        item["text"] = _image_markdown(asset, inline_images) if inline_images else ""
+        item["text"] = _image_markdown(asset, inline_images, item.get("data_uri")) if inline_images else ""
 
 
 def render_pdf_markdown_inline(
@@ -647,6 +650,7 @@ def render_pdf_markdown_inline(
                 source_filename=source_filename,
                 conversion_id=conversion_id,
                 start_index=len(images),
+                inline_images=inline_images,
             )
             images.extend(page_images)
             items = sorted(
